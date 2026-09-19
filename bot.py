@@ -22,12 +22,11 @@ from telegram.ext import (
 # =========================================================
 
 BOT_USERNAME = "MahfelShansBot"
-
 DB_FILE = "mahfelshans.db"
 
 INSTAGRAM_URL = "https://instagram.com/MAHFELSHANS"
 YOUTUBE_URL = "https://youtube.com/@mahfelshans"
-TELEGRAM_CHANNEL_URL = "https://t.me/MahfelShans"
+TELEGRAM_URL = "https://t.me/MahfelShans"
 
 DEFAULT_YOUTUBE_HANDLE = "@mahfelshans"
 DEFAULT_TELEGRAM_CHANNEL = "@MahfelShans"
@@ -69,14 +68,13 @@ def setting_get(conn, key, default=None):
 def setting_set(conn, key, value):
     conn.execute(
         """
-        INSERT INTO settings(key, value)
-        VALUES(?, ?)
+        INSERT INTO settings(key,value)
+        VALUES(?,?)
         ON CONFLICT(key)
         DO UPDATE SET value=excluded.value
         """,
         (key, str(value))
     )
-    conn.commit()
 
 
 def setting_int(conn, key, default=0):
@@ -107,7 +105,9 @@ def init_db():
 
     conn = db()
 
-    # ---------------- USERS ----------------
+    # =====================================================
+    # USERS
+    # =====================================================
 
     conn.execute(
         """
@@ -129,7 +129,9 @@ def init_db():
         "INTEGER DEFAULT 0"
     )
 
-    # ---------------- REFERRALS ----------------
+    # =====================================================
+    # REFERRALS
+    # =====================================================
 
     conn.execute(
         """
@@ -142,7 +144,9 @@ def init_db():
         """
     )
 
-    # ---------------- CAMPAIGNS ----------------
+    # =====================================================
+    # CAMPAIGNS
+    # =====================================================
 
     conn.execute(
         """
@@ -192,7 +196,9 @@ def init_db():
         "INTEGER DEFAULT 0"
     )
 
-    # ---------------- PARTICIPATIONS ----------------
+    # =====================================================
+    # PARTICIPATIONS
+    # =====================================================
 
     conn.execute(
         """
@@ -202,12 +208,14 @@ def init_db():
             user_id INTEGER,
             chances_used INTEGER DEFAULT 1,
             created_at TEXT,
-            UNIQUE(campaign_id, user_id)
+            UNIQUE(campaign_id,user_id)
         )
         """
     )
 
-    # ---------------- RULE ACCEPTANCES ----------------
+    # =====================================================
+    # RULE ACCEPTANCES
+    # =====================================================
 
     conn.execute(
         """
@@ -218,12 +226,14 @@ def init_db():
             rules_version INTEGER,
             accepted INTEGER DEFAULT 0,
             accepted_at TEXT,
-            UNIQUE(user_id, campaign_id)
+            UNIQUE(user_id,campaign_id)
         )
         """
     )
 
-    # ---------------- WINNERS ----------------
+    # =====================================================
+    # WINNERS
+    # =====================================================
 
     conn.execute(
         """
@@ -239,7 +249,9 @@ def init_db():
         """
     )
 
-    # ---------------- SUPPORT ----------------
+    # =====================================================
+    # SUPPORT
+    # =====================================================
 
     conn.execute(
         """
@@ -255,7 +267,9 @@ def init_db():
         """
     )
 
-    # ---------------- PAYMENTS ----------------
+    # =====================================================
+    # PAYMENTS
+    # =====================================================
 
     conn.execute(
         """
@@ -273,7 +287,9 @@ def init_db():
         """
     )
 
-    # ---------------- SETTINGS ----------------
+    # =====================================================
+    # SETTINGS
+    # =====================================================
 
     conn.execute(
         """
@@ -284,7 +300,9 @@ def init_db():
         """
     )
 
-    # ---------------- LOGS ----------------
+    # =====================================================
+    # LOGS
+    # =====================================================
 
     conn.execute(
         """
@@ -305,24 +323,16 @@ def init_db():
         "payment_enabled": "0",
         "rules_version": "1",
 
-        # NETWORK SETTINGS
         "instagram_followers": os.environ.get(
             "INSTAGRAM_FOLLOWERS",
             "0"
         ),
+
         "youtube_followers": "0",
         "telegram_followers": "0",
         "networks_activated": "0",
         "network_last_update": "",
     }
-
-    default_rules = (
-        "۱. شرکت در مسابقات طبق قوانین اعلام‌شده انجام می‌شود.\n"
-        "۲. هر کاربر مسئول اطلاعات حساب خود است.\n"
-        "۳. هر معرفی موفق یک شانس اضافه ایجاد می‌کند.\n"
-        "۴. اعلام برندگان پس از قرعه‌کشی انجام خواهد شد.\n"
-        "۵. قوانین هر کمپین ممکن است شرایط اختصاصی داشته باشد."
-    )
 
     for key, value in defaults.items():
 
@@ -332,13 +342,27 @@ def init_db():
         ).fetchone()
 
         if not exists:
+
             conn.execute(
                 "INSERT INTO settings(key,value) VALUES(?,?)",
                 (key, str(value))
             )
 
+    default_rules = (
+        "۱. شرکت در مسابقات طبق قوانین اعلام‌شده انجام می‌شود.\n"
+        "۲. هر کاربر مسئول اطلاعات حساب خود است.\n"
+        "۳. هر معرفی موفق یک شانس اضافه ایجاد می‌کند.\n"
+        "۴. اعلام برندگان پس از قرعه‌کشی انجام خواهد شد.\n"
+        "۵. قوانین هر کمپین ممکن است شرایط اختصاصی داشته باشد."
+    )
+
     if not setting_get(conn, "rules_text"):
-        setting_set(conn, "rules_text", default_rules)
+
+        setting_set(
+            conn,
+            "rules_text",
+            default_rules
+        )
 
     campaign_count = conn.execute(
         "SELECT COUNT(*) AS c FROM campaigns"
@@ -386,7 +410,6 @@ def init_db():
 def get_admin_ids():
 
     raw = os.environ.get("ADMIN_IDS", "")
-
     result = []
 
     for x in raw.split(","):
@@ -414,7 +437,8 @@ def log_action(admin_id, action):
 
     conn.execute(
         """
-        INSERT INTO operation_logs(admin_id, action, created_at)
+        INSERT INTO operation_logs
+        (admin_id,action,created_at)
         VALUES(?,?,?)
         """,
         (
@@ -434,9 +458,11 @@ async def admin_required(update):
 
     if not user or not is_admin(user.id):
 
-        await update.message.reply_text(
-            "⛔ این بخش فقط برای مدیریت ربات است."
-        )
+        if update.message:
+
+            await update.message.reply_text(
+                "⛔ این بخش فقط برای مدیریت ربات است."
+            )
 
         return False
 
@@ -452,9 +478,11 @@ def fetch_youtube_subscribers_sync():
     api_key = os.environ.get("YOUTUBE_API_KEY")
 
     if not api_key:
+
         logger.warning(
             "YOUTUBE_API_KEY is not configured."
         )
+
         return None
 
     handle = os.environ.get(
@@ -482,7 +510,10 @@ def fetch_youtube_subscribers_sync():
             }
         )
 
-        with urlopen(request, timeout=20) as response:
+        with urlopen(
+            request,
+            timeout=20
+        ) as response:
 
             data = json.loads(
                 response.read().decode("utf-8")
@@ -555,21 +586,6 @@ async def fetch_telegram_members(bot):
         return None
 
 
-def get_instagram_followers():
-
-    conn = db()
-
-    value = setting_int(
-        conn,
-        "instagram_followers",
-        0
-    )
-
-    conn.close()
-
-    return value
-
-
 # =========================================================
 # NETWORK STATUS
 # =========================================================
@@ -578,52 +594,47 @@ def get_network_counts():
 
     conn = db()
 
-    instagram = setting_int(
-        conn,
-        "instagram_followers",
-        0
-    )
+    data = {
+        "instagram": setting_int(
+            conn,
+            "instagram_followers",
+            0
+        ),
 
-    youtube = setting_int(
-        conn,
-        "youtube_followers",
-        0
-    )
+        "youtube": setting_int(
+            conn,
+            "youtube_followers",
+            0
+        ),
 
-    telegram = setting_int(
-        conn,
-        "telegram_followers",
-        0
-    )
+        "telegram": setting_int(
+            conn,
+            "telegram_followers",
+            0
+        ),
 
-    target = setting_int(
-        conn,
-        "activation_followers",
-        100000
-    )
+        "target": setting_int(
+            conn,
+            "activation_followers",
+            100000
+        ),
 
-    activated = setting_int(
-        conn,
-        "networks_activated",
-        0
-    )
+        "activated": setting_int(
+            conn,
+            "networks_activated",
+            0
+        ),
 
-    last_update = setting_get(
-        conn,
-        "network_last_update",
-        ""
-    )
+        "last_update": setting_get(
+            conn,
+            "network_last_update",
+            ""
+        ),
+    }
 
     conn.close()
 
-    return {
-        "instagram": instagram,
-        "youtube": youtube,
-        "telegram": telegram,
-        "target": target,
-        "activated": activated,
-        "last_update": last_update,
-    }
+    return data
 
 
 def network_status_text():
@@ -631,10 +642,6 @@ def network_status_text():
     data = get_network_counts()
 
     target = data["target"]
-
-    ig = data["instagram"]
-    yt = data["youtube"]
-    tg = data["telegram"]
 
     def line(name, count):
 
@@ -663,22 +670,28 @@ def network_status_text():
 
     text = (
         "📊 وضعیت رشد محفل خوش شانس ها\n\n"
-        f"📸 Instagram\n"
-        f"{line('Instagram', ig)}\n\n"
-        f"▶️ YouTube\n"
-        f"{line('YouTube', yt)}\n\n"
-        f"📢 Telegram\n"
-        f"{line('Telegram', tg)}\n\n"
+
+        "📸 Instagram\n"
+        + line("Instagram", data["instagram"])
+        + "\n\n"
+
+        "▶️ YouTube\n"
+        + line("YouTube", data["youtube"])
+        + "\n\n"
+
+        "📢 Telegram\n"
+        + line("Telegram", data["telegram"])
+        + "\n\n"
     )
 
     if (
-        ig >= target
-        and yt >= target
-        and tg >= target
+        data["instagram"] >= target
+        and data["youtube"] >= target
+        and data["telegram"] >= target
     ):
 
         text += (
-            "🎉 هر سه شبکه به ۱۰۰,۰۰۰ رسیده‌اند.\n"
+            "🎉 هر سه شبکه به حد نصاب رسیده‌اند.\n"
             "🔥 کمپین‌ها فعال هستند."
         )
 
@@ -733,20 +746,31 @@ def all_networks_reached(conn):
     )
 
 
+def lottery_is_active():
+
+    conn = db()
+
+    result = all_networks_reached(conn)
+
+    conn.close()
+
+    return result
+
+
 async def activate_all_campaigns(bot):
 
     conn = db()
+
+    if not all_networks_reached(conn):
+
+        conn.close()
+        return False
 
     already = setting_int(
         conn,
         "networks_activated",
         0
     )
-
-    if not all_networks_reached(conn):
-
-        conn.close()
-        return False
 
     if already == 1:
 
@@ -822,6 +846,7 @@ async def update_network_counts(bot, post_update=True):
 
     conn = db()
 
+    # Instagram is manual.
     instagram = setting_int(
         conn,
         "instagram_followers",
@@ -844,27 +869,18 @@ async def update_network_counts(bot, post_update=True):
             telegram
         )
 
-    now = datetime.utcnow().strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-
     setting_set(
         conn,
         "network_last_update",
-        now
+        datetime.utcnow().strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
     )
 
     conn.commit()
     conn.close()
 
-    logger.info(
-        "Network counts: IG=%s YT=%s TG=%s",
-        instagram,
-        youtube,
-        telegram
-    )
-
-    activated = await activate_all_campaigns(bot)
+    await activate_all_campaigns(bot)
 
     if post_update:
 
@@ -873,15 +889,13 @@ async def update_network_counts(bot, post_update=True):
             DEFAULT_TELEGRAM_CHANNEL
         )
 
-        status = network_status_text()
-
         try:
 
             await bot.send_message(
                 chat_id=channel,
                 text=(
                     "📈 گزارش خودکار رشد محفل خوش شانس ها\n\n"
-                    + status
+                    + network_status_text()
                 ),
                 disable_web_page_preview=True
             )
@@ -892,8 +906,6 @@ async def update_network_counts(bot, post_update=True):
                 "Could not post network update: %s",
                 e
             )
-
-    return activated
 
 
 async def periodic_network_update(app):
@@ -922,78 +934,94 @@ async def periodic_network_update(app):
 
 
 # =========================================================
-# START / REFERRAL
+# MAIN MENU
 # =========================================================
 
 def main_menu():
 
     return InlineKeyboardMarkup([
+
         [
             InlineKeyboardButton(
                 "🎁 کمپین‌ها",
                 callback_data="campaigns"
             ),
+
             InlineKeyboardButton(
                 "👤 پروفایل",
                 callback_data="profile"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🍀 شانس‌های من",
                 callback_data="chances"
             ),
+
             InlineKeyboardButton(
                 "👥 دعوت دوستان",
                 callback_data="invite"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "📜 تاریخچه",
                 callback_data="history"
             ),
+
             InlineKeyboardButton(
                 "🏆 برندگان",
                 callback_data="winners"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🗄 آرشیو",
                 callback_data="archive"
             ),
+
             InlineKeyboardButton(
                 "📋 قوانین",
                 callback_data="rules"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "🎧 پشتیبانی",
                 callback_data="support"
             )
         ],
+
         [
             InlineKeyboardButton(
                 "📸 Instagram",
                 url=INSTAGRAM_URL
             ),
+
             InlineKeyboardButton(
                 "▶️ YouTube",
                 url=YOUTUBE_URL
             )
         ],
+
         [
             InlineKeyboardButton(
-                "📢 کانال تلگرام",
-                url=TELEGRAM_CHANNEL_URL
+                "📢 Telegram",
+                url=TELEGRAM_URL
             )
         ]
     ])
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# START
+# =========================================================
+
+async def start(update, context):
 
     user = update.effective_user
 
@@ -1020,7 +1048,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
 
                     referrer_id = int(
-                        arg.replace("ref_", "", 1)
+                        arg.replace(
+                            "ref_",
+                            "",
+                            1
+                        )
                     )
 
                     if referrer_id != user.id:
@@ -1111,15 +1143,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    status = network_status_text()
-
     text = (
         "🎉 به «محفل خوش شانس ها» خوش آمدی!\n\n"
         "اینجا قراره با رشد جامعه محفل، "
         "کمپین‌ها و جوایز مختلف برگزار بشه.\n\n"
         "🔥 شرط شروع قرعه‌کشی:\n"
         "هر سه شبکه باید جداگانه به ۱۰۰,۰۰۰ نفر برسند.\n\n"
-        + status
+        + network_status_text()
         + "\n\n"
         "👇 از منوی زیر انتخاب کن:"
     )
@@ -1137,15 +1167,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_profile(update, context):
 
     user = update.effective_user
-
     conn = db()
 
     row = conn.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE id=?
-        """,
+        "SELECT * FROM users WHERE id=?",
         (user.id,)
     ).fetchone()
 
@@ -1168,11 +1193,17 @@ async def show_profile(update, context):
 
         return
 
+    username = (
+        "@" + row["username"]
+        if row["username"]
+        else "-"
+    )
+
     text = (
         "👤 پروفایل شما\n\n"
         f"نام: {row['first_name'] or '-'}\n"
         f"شناسه: {row['id']}\n"
-        f"نام کاربری: @{row['username'] if row['username'] else '-'}\n\n"
+        f"نام کاربری: {username}\n\n"
         f"🍀 شانس‌ها: {row['chances']}\n"
         f"👥 معرفی موفق: {referrals}"
     )
@@ -1204,7 +1235,7 @@ async def show_chances(update, context):
 
     await update.callback_query.message.reply_text(
         f"🍀 شانس‌های شما: {chances}\n\n"
-        "هر معرفی موفق یک شانس اضافه ایجاد می‌کند.",
+        "هر معرفی موفق یک شانس اضافه می‌کند.",
         reply_markup=main_menu()
     )
 
@@ -1261,20 +1292,19 @@ async def show_invite(update, context):
 # CAMPAIGNS
 # =========================================================
 
-def lottery_is_active():
-
-    conn = db()
-
-    active = all_networks_reached(conn)
-
-    conn.close()
-
-    return active
-
-
 async def show_campaigns(update, context):
 
     query = update.callback_query
+
+    if not lottery_is_active():
+
+        await query.message.reply_text(
+            "🔒 کمپین‌ها هنوز فعال نشده‌اند.\n\n"
+            + network_status_text(),
+            reply_markup=main_menu()
+        )
+
+        return
 
     conn = db()
 
@@ -1287,23 +1317,7 @@ async def show_campaigns(update, context):
         """
     ).fetchall()
 
-    networks_reached = all_networks_reached(conn)
-
     conn.close()
-
-    if not networks_reached:
-
-        text = (
-            "🔒 کمپین‌ها هنوز فعال نشده‌اند.\n\n"
-            + network_status_text()
-        )
-
-        await query.message.reply_text(
-            text,
-            reply_markup=main_menu()
-        )
-
-        return
 
     if not campaigns:
 
@@ -1353,11 +1367,7 @@ async def show_campaign_details(
     conn = db()
 
     campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
+        "SELECT * FROM campaigns WHERE id=?",
         (campaign_id,)
     ).fetchone()
 
@@ -1421,11 +1431,7 @@ async def show_campaign_rules(
     conn = db()
 
     campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
+        "SELECT * FROM campaigns WHERE id=?",
         (campaign_id,)
     ).fetchone()
 
@@ -1445,7 +1451,7 @@ async def show_campaign_rules(
     )
 
     text = (
-        f"📋 قوانین کمپین\n\n"
+        "📋 قوانین کمپین\n\n"
         f"{rules}\n\n"
         "در صورت قبول قوانین، روی دکمه زیر بزن."
     )
@@ -1472,15 +1478,10 @@ async def accept_rules(
 ):
 
     user = update.effective_user
-
     conn = db()
 
     campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
+        "SELECT * FROM campaigns WHERE id=?",
         (campaign_id,)
     ).fetchone()
 
@@ -1547,7 +1548,6 @@ async def join_campaign(
 ):
 
     user = update.effective_user
-
     conn = db()
 
     if not all_networks_reached(conn):
@@ -1562,11 +1562,7 @@ async def join_campaign(
         return
 
     campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
+        "SELECT * FROM campaigns WHERE id=?",
         (campaign_id,)
     ).fetchone()
 
@@ -1663,7 +1659,6 @@ async def join_campaign(
 async def show_history(update, context):
 
     user = update.effective_user
-
     conn = db()
 
     rows = conn.execute(
@@ -1686,7 +1681,9 @@ async def show_history(update, context):
 
     if not rows:
 
-        text = "📜 هنوز در هیچ کمپینی شرکت نکرده‌ای."
+        text = (
+            "📜 هنوز در هیچ کمپینی شرکت نکرده‌ای."
+        )
 
     else:
 
@@ -1742,14 +1739,14 @@ async def show_winners(update, context):
 
     else:
 
-        text = "🏆 برندگان محفل خوش شانس ها\n\n"
+        text = (
+            "🏆 برندگان محفل خوش شانس ها\n\n"
+        )
 
         for row in rows:
 
-            name = row["first_name"] or "کاربر"
-
             text += (
-                f"🥇 {name}\n"
+                f"🥇 {row['first_name'] or 'کاربر'}\n"
                 f"🎁 {row['title'] or '-'}\n"
                 f"🏆 {row['prize'] or '-'}\n\n"
             )
@@ -1940,9 +1937,11 @@ async def admin_panel(update, context):
 
         "🌐 شبکه‌ها:\n"
         "/igfollowers 100000\n"
+        "/ytfollowers 100000\n"
         "/followers 100000\n"
         "/activation 100000\n"
-        "/maxfollowers 500000\n\n"
+        "/maxfollowers 500000\n"
+        "/dailyprize 10000000\n\n"
 
         "🎁 کمپین:\n"
         "/newcampaign عنوان | توضیح | جایزه\n"
@@ -2040,7 +2039,7 @@ async def stats(update, context):
 
 
 # =========================================================
-# NETWORK STATUS COMMAND
+# NETWORK STATUS
 # =========================================================
 
 async def network_status_command(update, context):
@@ -2128,7 +2127,72 @@ async def set_instagram_followers(update, context):
 
 
 # =========================================================
-# OLD FOLLOWERS COMMAND
+# MANUAL YOUTUBE
+# =========================================================
+
+async def set_youtube_followers(update, context):
+
+    if not await admin_required(update):
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "مثال:\n"
+            "/ytfollowers 87420"
+        )
+
+        return
+
+    try:
+
+        count = int(
+            context.args[0].replace(",", "")
+        )
+
+        if count < 0:
+            raise ValueError
+
+    except Exception:
+
+        await update.message.reply_text(
+            "❌ عدد صحیح وارد کن."
+        )
+
+        return
+
+    conn = db()
+
+    setting_set(
+        conn,
+        "youtube_followers",
+        count
+    )
+
+    if not all_networks_reached(conn):
+
+        setting_set(
+            conn,
+            "networks_activated",
+            0
+        )
+
+    conn.commit()
+    conn.close()
+
+    log_action(
+        update.effective_user.id,
+        f"youtube_followers={count}"
+    )
+
+    await update.message.reply_text(
+        f"✅ YouTube روی {count:,} تنظیم شد.\n\n"
+        + network_status_text()
+    )
+
+
+# =========================================================
+# OLD FOLLOWERS
 # =========================================================
 
 async def set_followers(update, context):
@@ -2140,8 +2204,7 @@ async def set_followers(update, context):
 
         await update.message.reply_text(
             "مثال:\n/followers 100000\n\n"
-            "این دستور فقط برای تست مقدار قدیمی است.\n"
-            "فعال‌سازی واقعی بر اساس هر سه شبکه انجام می‌شود."
+            "این دستور فقط مقدار قدیمی followers را تغییر می‌دهد."
         )
 
         return
@@ -2168,6 +2231,7 @@ async def set_followers(update, context):
         count
     )
 
+    conn.commit()
     conn.close()
 
     log_action(
@@ -2176,13 +2240,13 @@ async def set_followers(update, context):
     )
 
     await update.message.reply_text(
-        f"✅ مقدار قدیمی followers روی {count:,} قرار گرفت.\n\n"
-        "⚠️ این مقدار دیگر شرط فعال‌سازی سه‌شبکه‌ای نیست."
+        f"✅ مقدار followers روی {count:,} قرار گرفت.\n"
+        "⚠️ شرط فعال‌سازی بر اساس سه شبکه است."
     )
 
 
 # =========================================================
-# ACTIVATION TARGET
+# ACTIVATION
 # =========================================================
 
 async def set_activation(update, context):
@@ -2229,6 +2293,7 @@ async def set_activation(update, context):
         0
     )
 
+    conn.commit()
     conn.close()
 
     log_action(
@@ -2237,7 +2302,8 @@ async def set_activation(update, context):
     )
 
     await update.message.reply_text(
-        f"🎯 حد فعال‌سازی هر شبکه: {count:,}"
+        f"🎯 حد فعال‌سازی هر شبکه: {count:,}\n\n"
+        + network_status_text()
     )
 
 
@@ -2276,6 +2342,7 @@ async def set_max_followers(update, context):
         value
     )
 
+    conn.commit()
     conn.close()
 
     await update.message.reply_text(
@@ -2318,6 +2385,7 @@ async def set_daily_prize(update, context):
         value
     )
 
+    conn.commit()
     conn.close()
 
     await update.message.reply_text(
@@ -2427,11 +2495,7 @@ async def campaigns_admin(update, context):
     conn = db()
 
     rows = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        ORDER BY id DESC
-        """
+        "SELECT * FROM campaigns ORDER BY id DESC"
     ).fetchall()
 
     conn.close()
@@ -2588,9 +2652,7 @@ async def set_draw_date(update, context):
 
     try:
 
-        campaign_id = int(
-            context.args[0]
-        )
+        campaign_id = int(context.args[0])
 
         date = context.args[1]
         time = context.args[2]
@@ -2887,7 +2949,7 @@ async def participants_admin(update, context):
 
 
 # =========================================================
-# WINNER ADMIN
+# WINNER
 # =========================================================
 
 async def set_winner(update, context):
@@ -2955,9 +3017,7 @@ async def set_winner(update, context):
         VALUES(?,?,?,?)
         ON CONFLICT(campaign_id)
         DO UPDATE SET
-            user_id=excluded.user_id,
-            announced=excluded.announced,
-            created_at=excluded.created_at
+            user_id=excluded.user_id
         """,
         (
             campaign_id,
@@ -3053,10 +3113,7 @@ async def announce_winner(update, context):
         DEFAULT_TELEGRAM_CHANNEL
     )
 
-    winner_name = (
-        row["first_name"]
-        or "برنده"
-    )
+    winner_name = row["first_name"] or "برنده"
 
     message = (
         "🏆🎉 برنده جدید محفل خوش شانس ها 🎉🏆\n\n"
@@ -3487,7 +3544,7 @@ async def button_handler(update, context):
 
 async def error_handler(update, context):
 
-    logger.exception(
+    logger.error(
         "Unhandled bot error",
         exc_info=context.error
     )
@@ -3528,7 +3585,9 @@ async def main():
         .build()
     )
 
-    # ---------------- USER ----------------
+    # =====================================================
+    # USER COMMANDS
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3543,7 +3602,9 @@ async def main():
         )
     )
 
-    # ---------------- ADMIN ----------------
+    # =====================================================
+    # ADMIN COMMANDS
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3566,6 +3627,7 @@ async def main():
         )
     )
 
+    # Instagram manual
     app.add_handler(
         CommandHandler(
             "igfollowers",
@@ -3573,6 +3635,15 @@ async def main():
         )
     )
 
+    # YouTube manual - NEW
+    app.add_handler(
+        CommandHandler(
+            "ytfollowers",
+            set_youtube_followers
+        )
+    )
+
+    # Old followers
     app.add_handler(
         CommandHandler(
             "followers",
@@ -3600,6 +3671,10 @@ async def main():
             set_daily_prize
         )
     )
+
+    # =====================================================
+    # CAMPAIGNS
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3638,10 +3713,25 @@ async def main():
 
     app.add_handler(
         CommandHandler(
+            "archive",
+            archive_campaign
+        )
+    )
+
+    # =====================================================
+    # RULES
+    # =====================================================
+
+    app.add_handler(
+        CommandHandler(
             "rulesadmin",
             rules_admin
         )
     )
+
+    # =====================================================
+    # USERS
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3671,6 +3761,10 @@ async def main():
         )
     )
 
+    # =====================================================
+    # WINNERS
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "winner",
@@ -3685,12 +3779,9 @@ async def main():
         )
     )
 
-    app.add_handler(
-        CommandHandler(
-            "archive",
-            archive_campaign
-        )
-    )
+    # =====================================================
+    # BROADCAST
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3698,6 +3789,10 @@ async def main():
             broadcast
         )
     )
+
+    # =====================================================
+    # SUPPORT
+    # =====================================================
 
     app.add_handler(
         CommandHandler(
@@ -3713,6 +3808,10 @@ async def main():
         )
     )
 
+    # =====================================================
+    # LOGS
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "logs",
@@ -3720,12 +3819,13 @@ async def main():
         )
     )
 
-    # ---------------- SUPPORT ----------------
+    # =====================================================
+    # SUPPORT MESSAGE
+    # =====================================================
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
+            filters.TEXT & ~filters.COMMAND,
             handle_support_message
         )
     )
@@ -3733,6 +3833,10 @@ async def main():
     app.add_error_handler(
         error_handler
     )
+
+    # =====================================================
+    # RENDER
+    # =====================================================
 
     port = int(
         os.environ.get(
@@ -3743,12 +3847,9 @@ async def main():
 
     render_url = render_url.rstrip("/")
 
-    # Initialize application
     await app.initialize()
-
     await app.start()
 
-    # Webhook
     await app.updater.start_webhook(
         listen="0.0.0.0",
         port=port,
@@ -3767,7 +3868,6 @@ async def main():
         NETWORK_UPDATE_HOURS
     )
 
-    # Automatic network updater
     network_task = asyncio.create_task(
         periodic_network_update(app)
     )
@@ -3795,6 +3895,10 @@ async def main():
         await app.stop()
         await app.shutdown()
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
 
