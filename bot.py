@@ -2,7 +2,6 @@ import os
 import sqlite3
 import logging
 import asyncio
-import json
 import random
 from datetime import datetime
 from urllib.request import Request, urlopen
@@ -17,28 +16,14 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-# =========================================================
-# CONFIG
-# =========================================================
-
-BOT_USERNAME = "MahfelShansBot"
-DB_FILE = "mahfelshans.db"
-
-INSTAGRAM_URL = "https://instagram.com/MAHFELSHANS"
-YOUTUBE_URL = "https://youtube.com/@mahfelshans"
-TELEGRAM_URL = "https://t.me/MahfelShans"
-
-DEFAULT_YOUTUBE_HANDLE = "@mahfelshans"
-DEFAULT_TELEGRAM_CHANNEL = "@MahfelShans"
-
-NETWORK_UPDATE_HOURS = int(
-    os.environ.get("NETWORK_UPDATE_HOURS", "6")
-)
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,47 +33,82 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =========================================================
-# ENV
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+BOT_USERNAME = "MahfelShansBot"
+
+DB_FILE = "mahfelshans.db"
+
+INSTAGRAM_URL = "https://instagram.com/MAHFELSHANS"
+YOUTUBE_URL = "https://youtube.com/@mahfelshans"
+TELEGRAM_URL = "https://t.me/MahfelShans"
+
+DEFAULT_YOUTUBE_HANDLE = "@mahfelshans"
+DEFAULT_TELEGRAM_CHANNEL = "@MahfelShans"
+
+CHANNEL_POST_INTERVAL_HOURS = int(
+    os.environ.get("CHANNEL_POST_INTERVAL_HOURS", "2")
+)
+
+NETWORK_UPDATE_HOURS = int(
+    os.environ.get("NETWORK_UPDATE_HOURS", "6")
+)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+
+YOUTUBE_HANDLE = os.environ.get(
+    "YOUTUBE_HANDLE",
+    DEFAULT_YOUTUBE_HANDLE
+).strip()
+
+TELEGRAM_CHANNEL = os.environ.get(
+    "TELEGRAM_CHANNEL",
+    DEFAULT_TELEGRAM_CHANNEL
+).strip()
+
+PORT = int(os.environ.get("PORT", "10000"))
 
 ADMIN_IDS = set()
 
 for item in os.environ.get("ADMIN_IDS", "").split(","):
     item = item.strip()
-    if item.isdigit():
-        ADMIN_IDS.add(int(item))
-
-YOUTUBE_HANDLE = os.environ.get(
-    "YOUTUBE_HANDLE",
-    DEFAULT_YOUTUBE_HANDLE,
-)
-
-TELEGRAM_CHANNEL = os.environ.get(
-    "TELEGRAM_CHANNEL",
-    DEFAULT_TELEGRAM_CHANNEL,
-)
-
-PORT = int(os.environ.get("PORT", "10000"))
+    if item:
+        try:
+            ADMIN_IDS.add(int(item))
+        except ValueError:
+            pass
 
 
-# =========================================================
+# ============================================================
+# GENERAL
+# ============================================================
+
+RULES_VERSION = "1.0"
+
+INSTAGRAM_VERIFICATION_ENABLED = False
+YOUTUBE_VERIFICATION_ENABLED = False
+TELEGRAM_MEMBERSHIP_REQUIRED = True
+
+
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
-def db():
-    conn = sqlite3.connect(DB_FILE)
+def db_connect():
+    conn = sqlite3.connect(
+        DB_FILE,
+        check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-
-    conn = db()
+    conn = db_connect()
     cur = conn.cursor()
 
     cur.execute("""
@@ -99,9 +119,9 @@ def init_db():
             phone TEXT,
             joined_at TEXT,
             accepted_rules INTEGER DEFAULT 0,
-            rules_version TEXT DEFAULT '1.0',
-            chances INTEGER DEFAULT 1,
-            referred_by INTEGER DEFAULT NULL,
+            rules_version TEXT DEFAULT '',
+            chances INTEGER DEFAULT 0,
+            referred_by INTEGER,
             is_active INTEGER DEFAULT 1
         )
     """)
@@ -122,9 +142,9 @@ def init_db():
             description TEXT,
             prize TEXT,
             prize_count INTEGER DEFAULT 1,
-            sponsor_id INTEGER DEFAULT NULL,
-            sponsor_name TEXT DEFAULT '',
-            sponsor_budget INTEGER DEFAULT 0,
+            sponsor_id INTEGER,
+            sponsor_name TEXT,
+            sponsor_budget REAL DEFAULT 0,
             draw_date TEXT,
             status TEXT DEFAULT 'active',
             created_at TEXT
@@ -136,7 +156,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             campaign_id INTEGER,
             user_id INTEGER,
-            chance_number INTEGER DEFAULT 1,
+            chance_number INTEGER,
             created_at TEXT,
             UNIQUE(campaign_id, user_id, chance_number)
         )
@@ -167,10 +187,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             message TEXT,
-            answer TEXT,
             status TEXT DEFAULT 'open',
             created_at TEXT,
-            answered_at TEXT
+            replied_at TEXT,
+            reply TEXT
         )
     """)
 
@@ -178,10 +198,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            amount INTEGER,
-            authority TEXT,
-            ref_id TEXT,
+            amount REAL,
             status TEXT,
+            reference TEXT,
             created_at TEXT
         )
     """)
@@ -190,10 +209,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sponsors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
+            phone TEXT,
+            budget REAL DEFAULT 0,
             description TEXT,
-            website TEXT,
-            budget INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'active',
             created_at TEXT
         )
     """)
@@ -208,8 +226,9 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS operation_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            admin_id INTEGER,
             action TEXT,
+            details TEXT,
             created_at TEXT
         )
     """)
@@ -219,120 +238,93 @@ def init_db():
         "plan_max_followers": "1000000",
         "daily_prize_amount": "10000000",
         "payment_enabled": "0",
-        "rules_version": "1.0",
+
+        "rules_version": RULES_VERSION,
+
         "instagram_followers": "0",
         "youtube_followers": "0",
         "telegram_followers": "0",
+
         "networks_activated": "0",
         "network_last_update": "",
+
         "total_sponsor_budget": "0",
+
+        "instagram_verification_enabled": "0",
+        "youtube_verification_enabled": "0",
+        "telegram_membership_required": "1",
     }
 
     for key, value in defaults.items():
         cur.execute(
-            """
-            INSERT OR IGNORE INTO settings(key,value)
-            VALUES(?,?)
-            """,
-            (key, value),
+            "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+            (key, value)
         )
 
     conn.commit()
     conn.close()
 
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
-def setting_get(conn, key, default=None):
+def get_setting(key, default=None):
+    conn = db_connect()
     row = conn.execute(
         "SELECT value FROM settings WHERE key=?",
-        (key,),
+        (key,)
     ).fetchone()
+    conn.close()
 
-    if row is None:
-        return default
+    if row:
+        return row["value"]
 
-    return row["value"]
+    return default
 
 
-def setting_set(conn, key, value):
-    conn.execute(
-        """
-        INSERT INTO settings(key,value)
-        VALUES(?,?)
+def set_setting(key, value):
+    conn = db_connect()
+
+    conn.execute("""
+        INSERT INTO settings(key, value)
+        VALUES(?, ?)
         ON CONFLICT(key)
         DO UPDATE SET value=excluded.value
-        """,
-        (key, str(value)),
-    )
-
-
-# =========================================================
-# LOG
-# =========================================================
-
-def log_action(user_id, action):
-
-    conn = db()
-
-    conn.execute(
-        """
-        INSERT INTO operation_logs(
-            user_id,
-            action,
-            created_at
-        )
-        VALUES(?,?,?)
-        """,
-        (
-            user_id,
-            action,
-            datetime.utcnow().isoformat(),
-        ),
-    )
+    """, (key, str(value)))
 
     conn.commit()
     conn.close()
 
 
-# =========================================================
-# ADMIN
-# =========================================================
+def log_operation(admin_id, action, details=""):
+    conn = db_connect()
 
-async def admin_required(update):
+    conn.execute("""
+        INSERT INTO operation_logs(
+            admin_id,
+            action,
+            details,
+            created_at
+        )
+        VALUES(?,?,?,?)
+    """, (
+        admin_id,
+        action,
+        details,
+        datetime.utcnow().isoformat()
+    ))
 
-    user = update.effective_user
-
-    if not user or user.id not in ADMIN_IDS:
-
-        if update.callback_query:
-            await update.callback_query.answer(
-                "دسترسی ندارید.",
-                show_alert=True,
-            )
-        elif update.message:
-            await update.message.reply_text(
-                "❌ شما دسترسی مدیریت ندارید."
-            )
-
-        return False
-
-    return True
+    conn.commit()
+    conn.close()
 
 
-# =========================================================
-# USER
-# =========================================================
+# ============================================================
+# USER FUNCTIONS
+# ============================================================
 
 def get_user(user_id):
-
-    conn = db()
+    conn = db_connect()
 
     row = conn.execute(
         "SELECT * FROM users WHERE id=?",
-        (user_id,),
+        (user_id,)
     ).fetchone()
 
     conn.close()
@@ -341,39 +333,80 @@ def get_user(user_id):
 
 
 def create_user(tg_user, referred_by=None):
-
-    conn = db()
+    conn = db_connect()
 
     existing = conn.execute(
-        "SELECT id FROM users WHERE id=?",
-        (tg_user.id,),
+        "SELECT * FROM users WHERE id=?",
+        (tg_user.id,)
     ).fetchone()
 
     if existing:
+        conn.execute("""
+            UPDATE users
+            SET first_name=?,
+                username=?
+            WHERE id=?
+        """, (
+            tg_user.first_name or "",
+            tg_user.username or "",
+            tg_user.id
+        ))
+
+        conn.commit()
         conn.close()
+
         return False
 
-    now = datetime.utcnow().isoformat()
-
-    conn.execute(
-        """
+    conn.execute("""
         INSERT INTO users(
             id,
             first_name,
             username,
             joined_at,
-            referred_by
-        )
-        VALUES(?,?,?,?,?)
-        """,
-        (
-            tg_user.id,
-            tg_user.first_name or "",
-            tg_user.username or "",
-            now,
+            chances,
             referred_by,
-        ),
-    )
+            is_active
+        )
+        VALUES(?,?,?,?,?,?,?)
+    """, (
+        tg_user.id,
+        tg_user.first_name or "",
+        tg_user.username or "",
+        datetime.utcnow().isoformat(),
+        1,
+        referred_by,
+        1
+    ))
+
+    if referred_by and referred_by != tg_user.id:
+        inviter = conn.execute(
+            "SELECT id FROM users WHERE id=?",
+            (referred_by,)
+        ).fetchone()
+
+        if inviter:
+            try:
+                conn.execute("""
+                    INSERT INTO referrals(
+                        inviter_id,
+                        invited_id,
+                        created_at
+                    )
+                    VALUES(?,?,?)
+                """, (
+                    referred_by,
+                    tg_user.id,
+                    datetime.utcnow().isoformat()
+                ))
+
+                conn.execute("""
+                    UPDATE users
+                    SET chances = chances + 1
+                    WHERE id=?
+                """, (referred_by,))
+
+            except sqlite3.IntegrityError:
+                pass
 
     conn.commit()
     conn.close()
@@ -381,281 +414,102 @@ def create_user(tg_user, referred_by=None):
     return True
 
 
-# =========================================================
-# RULES
-# =========================================================
+def accept_rules(user_id):
+    conn = db_connect()
 
-def current_rules_version():
+    conn.execute("""
+        UPDATE users
+        SET accepted_rules=1,
+            rules_version=?
+        WHERE id=?
+    """, (
+        RULES_VERSION,
+        user_id
+    ))
 
-    conn = db()
+    conn.execute("""
+        INSERT INTO rule_acceptances(
+            user_id,
+            rules_version,
+            accepted_at
+        )
+        VALUES(?,?,?)
+    """, (
+        user_id,
+        RULES_VERSION,
+        datetime.utcnow().isoformat()
+    ))
 
-    value = setting_get(
-        conn,
-        "rules_version",
-        "1.0",
-    )
-
+    conn.commit()
     conn.close()
 
-    return value
+
+# ============================================================
+# NETWORK STATUS
+# ============================================================
+
+def get_network_counts():
+    return {
+        "instagram": int(get_setting("instagram_followers", "0") or 0),
+        "youtube": int(get_setting("youtube_followers", "0") or 0),
+        "telegram": int(get_setting("telegram_followers", "0") or 0),
+    }
 
 
-def rules_text():
-
-    version = current_rules_version()
-
-    return f"""
-📋 قوانین محفل خوش‌شانس‌ها
-
-نسخه قوانین: {version}
-
-1️⃣ ثبت‌نام در محفل رایگان است.
-
-2️⃣ شرکت در کمپین‌ها و قرعه‌کشی‌های محفل
-بر اساس قوانین اعلام‌شده هر کمپین انجام می‌شود.
-
-3️⃣ جوایز کمپین‌ها توسط محفل و/یا اسپانسر
-کمپین تأمین می‌شوند.
-
-4️⃣ هیچ مبلغی بابت خرید شانس قرعه‌کشی
-از کاربر دریافت نمی‌شود.
-
-5️⃣ اطلاعات صحیح هنگام ثبت‌نام بر عهده کاربر است.
-
-6️⃣ نتیجه قرعه‌کشی پس از انجام فرآیند رسمی
-در بخش برندگان اعلام می‌شود.
-
-7️⃣ امکان بررسی و ثبت سوابق کمپین‌ها و برندگان
-در سیستم وجود دارد.
-
-8️⃣ با ادامه فعالیت در محفل، کاربر تأیید می‌کند
-که قوانین هر کمپین را مطالعه کرده است.
-"""
-
-
-def rules_keyboard():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ قبول قوانین",
-                callback_data="accept_rules",
-            )
-        ]
-    ])
-
-
-# =========================================================
-# MAIN MENU
-# =========================================================
-
-def main_menu():
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🎁 کمپین‌ها",
-                callback_data="campaigns",
-            ),
-            InlineKeyboardButton(
-                "👤 پروفایل",
-                callback_data="profile",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🍀 شانس‌های من",
-                callback_data="chances",
-            ),
-            InlineKeyboardButton(
-                "👥 دعوت دوستان",
-                callback_data="invite",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📜 تاریخچه",
-                callback_data="history",
-            ),
-            InlineKeyboardButton(
-                "🏆 برندگان",
-                callback_data="winners",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🗄 آرشیو",
-                callback_data="archive",
-            ),
-            InlineKeyboardButton(
-                "📋 قوانین",
-                callback_data="rules",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🎧 پشتیبانی",
-                callback_data="support",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📸 Instagram",
-                url=INSTAGRAM_URL,
-            ),
-            InlineKeyboardButton(
-                "▶️ YouTube",
-                url=YOUTUBE_URL,
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "📢 Telegram",
-                url=TELEGRAM_URL,
-            ),
-        ],
-    ])
-
-
-# =========================================================
-# NETWORK
-# =========================================================
-
-def all_networks_reached(conn):
-
-    target = int(
-        setting_get(
-            conn,
+def activation_target():
+    return int(
+        get_setting(
             "activation_followers",
-            "100000",
+            "100000"
         )
     )
 
-    instagram = int(
-        setting_get(
-            conn,
-            "instagram_followers",
-            "0",
-        )
-    )
 
-    youtube = int(
-        setting_get(
-            conn,
-            "youtube_followers",
-            "0",
-        )
-    )
-
-    telegram = int(
-        setting_get(
-            conn,
-            "telegram_followers",
-            "0",
-        )
-    )
+def all_networks_reached():
+    counts = get_network_counts()
+    target = activation_target()
 
     return (
-        instagram >= target
-        and youtube >= target
-        and telegram >= target
+        counts["instagram"] >= target
+        and counts["youtube"] >= target
+        and counts["telegram"] >= target
     )
-
-
-def network_status_text():
-
-    conn = db()
-
-    target = int(
-        setting_get(
-            conn,
-            "activation_followers",
-            "100000",
-        )
-    )
-
-    ig = int(
-        setting_get(
-            conn,
-            "instagram_followers",
-            "0",
-        )
-    )
-
-    yt = int(
-        setting_get(
-            conn,
-            "youtube_followers",
-            "0",
-        )
-    )
-
-    tg = int(
-        setting_get(
-            conn,
-            "telegram_followers",
-            "0",
-        )
-    )
-
-    active = all_networks_reached(conn)
-
-    conn.close()
-
-    return f"""
-📊 وضعیت شبکه
-
-Instagram:
-{ig:,} / {target:,}
-
-YouTube:
-{yt:,} / {target:,}
-
-Telegram:
-{tg:,} / {target:,}
-
-وضعیت:
-{"🟢 فعال" if active else "🔴 هنوز به حدنصاب نرسیده"}
-"""
 
 
 def lottery_is_active():
-
-    conn = db()
-
-    active = all_networks_reached(conn)
-
-    conn.close()
-
-    return active
+    return all_networks_reached()
 
 
-# =========================================================
+def network_status_text():
+    counts = get_network_counts()
+    target = activation_target()
+
+    active = all_networks_reached()
+
+    status = "🟢 قرعه‌کشی فعال شده است" if active else "🔴 هنوز فعال نشده است"
+
+    return (
+        "📊 وضعیت شبکه محفل خوش‌شانس‌ها\n\n"
+        f"📸 اینستاگرام: {counts['instagram']:,}\n"
+        f"▶️ یوتیوب: {counts['youtube']:,}\n"
+        f"📢 تلگرام: {counts['telegram']:,}\n\n"
+        f"🎯 هدف فعال شدن قرعه‌کشی: {target:,}\n\n"
+        f"وضعیت: {status}"
+    )
+
+
+# ============================================================
 # YOUTUBE API
-# =========================================================
+# ============================================================
 
-def fetch_youtube_subscribers():
-
+def get_youtube_subscribers():
     if not YOUTUBE_API_KEY:
         return None
 
-    handle = YOUTUBE_HANDLE
-
-    if handle.startswith("@"):
-        handle = handle[1:]
-
     try:
-
         params = urlencode({
             "part": "statistics",
-            "forHandle": handle,
+            "forHandle": YOUTUBE_HANDLE,
             "key": YOUTUBE_API_KEY,
         })
 
@@ -667,24 +521,25 @@ def fetch_youtube_subscribers():
         request = Request(
             url,
             headers={
-                "User-Agent": "MahfelShansBot/1.0"
-            },
+                "User-Agent": "Mozilla/5.0"
+            }
         )
 
         with urlopen(request, timeout=20) as response:
+            data = response.read().decode("utf-8")
 
-            data = json.loads(
-                response.read().decode("utf-8")
-            )
+        import json
 
-        items = data.get("items", [])
+        payload = json.loads(data)
+
+        items = payload.get("items", [])
 
         if not items:
             return None
 
-        count = items[0]["statistics"].get(
-            "subscriberCount"
-        )
+        statistics = items[0].get("statistics", {})
+
+        count = statistics.get("subscriberCount")
 
         if count is None:
             return None
@@ -692,1216 +547,1207 @@ def fetch_youtube_subscribers():
         return int(count)
 
     except Exception as e:
-
         logger.warning(
-            "YouTube API error: %s",
-            e,
+            "YouTube subscriber error: %s",
+            e
         )
 
         return None
 
 
-async def fetch_telegram_members(bot):
+# ============================================================
+# TELEGRAM MEMBERSHIP
+# ============================================================
+
+async def check_telegram_membership(bot, user_id):
+    if not TELEGRAM_MEMBERSHIP_REQUIRED:
+        return True
 
     try:
-
-        return await bot.get_chat_member_count(
-            TELEGRAM_CHANNEL
+        member = await bot.get_chat_member(
+            TELEGRAM_CHANNEL,
+            user_id
         )
+
+        if member.status in (
+            "creator",
+            "administrator",
+            "member",
+        ):
+            return True
+
+        if member.status == "restricted":
+            return bool(
+                getattr(
+                    member,
+                    "is_member",
+                    False
+                )
+            )
+
+        return False
 
     except Exception as e:
-
         logger.warning(
-            "Telegram count error: %s",
-            e,
+            "Telegram membership check error: %s",
+            e
         )
 
-        return None
+        return False
 
 
-# =========================================================
-# NETWORK UPDATE
-# =========================================================
+# ============================================================
+# ELIGIBILITY
+# ============================================================
 
-async def update_network_counts(bot):
+def eligibility_keyboard():
+    bot_url = f"https://t.me/{BOT_USERNAME}"
 
-    conn = db()
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📢 عضویت در تلگرام",
+                url=TELEGRAM_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📸 اینستاگرام",
+                url=INSTAGRAM_URL
+            ),
+            InlineKeyboardButton(
+                "▶️ یوتیوب",
+                url=YOUTUBE_URL
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 بررسی عضویت",
+                callback_data="verify_membership"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎧 پشتیبانی",
+                url=bot_url
+            )
+        ],
+    ])
 
-    yt = fetch_youtube_subscribers()
 
-    if yt is not None:
-        setting_set(
-            conn,
-            "youtube_followers",
-            yt,
-        )
+async def verify_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
 
-    tg = await fetch_telegram_members(bot)
+    await query.answer()
 
-    if tg is not None:
-        setting_set(
-            conn,
-            "telegram_followers",
-            tg,
-        )
+    user_id = query.from_user.id
 
-    setting_set(
-        conn,
-        "network_last_update",
-        datetime.utcnow().isoformat(),
+    is_member = await check_telegram_membership(
+        context.bot,
+        user_id
     )
 
-    if all_networks_reached(conn):
-        setting_set(
-            conn,
-            "networks_activated",
-            "1",
+    if not is_member:
+        await query.edit_message_text(
+            "❌ هنوز عضویت تلگرام شما تأیید نشده است.\n\n"
+            "ابتدا وارد کانال محفل خوش‌شانس‌ها شوید و سپس "
+            "روی «🔄 بررسی عضویت» بزنید.",
+            reply_markup=eligibility_keyboard()
         )
-    else:
-        setting_set(
-            conn,
-            "networks_activated",
-            "0",
-        )
+        return
 
-    conn.commit()
-    conn.close()
+    await query.edit_message_text(
+        "✅ عضویت تلگرام شما تأیید شد.\n\n"
+        "📸 دنبال کردن اینستاگرام\n"
+        "▶️ دنبال کردن یوتیوب\n"
+        "📢 عضویت تلگرام\n\n"
+        "این موارد برای دریافت جایزه الزامی هستند.\n\n"
+        "⚠️ در نسخه فعلی، بررسی خودکار اینستاگرام و یوتیوب "
+        "هنوز فعال نشده و در مرحله بعد به سیستم اضافه می‌شود.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📢 کانال تلگرام",
+                    url=TELEGRAM_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📸 اینستاگرام",
+                    url=INSTAGRAM_URL
+                ),
+                InlineKeyboardButton(
+                    "▶️ یوتیوب",
+                    url=YOUTUBE_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 بازگشت",
+                    callback_data="back_main"
+                )
+            ]
+        ])
+    )
 
 
-async def network_loop(app):
+# ============================================================
+# MAIN MENU
+# ============================================================
 
-    while True:
-
-        try:
-
-            await update_network_counts(
-                app.bot
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🎁 مسابقات",
+                callback_data="campaigns"
+            ),
+            InlineKeyboardButton(
+                "👤 پروفایل",
+                callback_data="profile"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🎟 شانس‌های من",
+                callback_data="chances"
+            ),
+            InlineKeyboardButton(
+                "👥 دعوت دوستان",
+                callback_data="invite"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🏆 برندگان",
+                callback_data="winners"
+            ),
+            InlineKeyboardButton(
+                "📜 آرشیو",
+                callback_data="archive"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 قوانین",
+                callback_data="rules"
+            ),
+            InlineKeyboardButton(
+                "🎧 پشتیبانی",
+                callback_data="support"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📸 اینستاگرام",
+                url=INSTAGRAM_URL
+            ),
+            InlineKeyboardButton(
+                "▶️ یوتیوب",
+                url=YOUTUBE_URL
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 کانال تلگرام",
+                url=TELEGRAM_URL
             )
-
-        except Exception as e:
-
-            logger.exception(
-                "Network loop error: %s",
-                e,
-            )
-
-        await asyncio.sleep(
-            NETWORK_UPDATE_HOURS * 3600
-        )
+        ],
+    ])
 
 
-# =========================================================
+# ============================================================
+# RULES
+# ============================================================
+
+RULES_TEXT = """
+📋 قوانین محفل خوش‌شانس‌ها
+
+1️⃣ ثبت‌نام و دریافت شانس در این مرحله رایگان است.
+
+2️⃣ برای دریافت شانس بیشتر می‌توانید دوستان خود را دعوت کنید.
+
+3️⃣ برای دریافت جایزه، رعایت شرایط اعلام‌شده مسابقه الزامی است.
+
+4️⃣ عضویت در کانال تلگرام برای دریافت جایزه الزامی است.
+
+5️⃣ دنبال کردن اینستاگرام و یوتیوب نیز جزو شرایط دریافت جایزه است.
+بررسی خودکار این دو مورد در مرحله بعد به سیستم اضافه می‌شود.
+
+6️⃣ قرعه‌کشی پس از رسیدن شبکه‌های تعیین‌شده به حد فعال‌سازی انجام می‌شود.
+
+7️⃣ در حال حاضر هدف فعال‌سازی:
+100,000 دنبال‌کننده / عضو برای هر شبکه تعیین شده است.
+
+8️⃣ محفل خوش‌شانس‌ها در این مرحله هیچ مبلغی بابت شانس قرعه‌کشی دریافت نمی‌کند.
+
+9️⃣ در صورت عدم رعایت شرایط جایزه، امکان عدم تأیید یا لغو جایزه وجود دارد.
+
+🔟 تصمیم نهایی درباره اجرای هر کمپین مطابق قوانین همان کمپین اعلام خواهد شد.
+"""
+
+
+# ============================================================
 # START
-# =========================================================
+# ============================================================
 
-async def start(update, context):
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     referred_by = None
 
     if context.args:
+        arg = context.args[0].strip()
 
-        value = context.args[0]
-
-        if value.startswith("ref_"):
-
-            raw = value.replace(
-                "ref_",
-                "",
-                1,
-            )
-
-            if raw.isdigit():
-
-                ref_id = int(raw)
-
-                if ref_id != user.id:
-                    referred_by = ref_id
+        if arg.startswith("ref_"):
+            try:
+                referred_by = int(
+                    arg.replace("ref_", "", 1)
+                )
+            except ValueError:
+                referred_by = None
 
     is_new = create_user(
         user,
-        referred_by,
+        referred_by=referred_by
     )
 
-    if is_new and referred_by:
+    db_user = get_user(user.id)
 
-        conn = db()
-
-        inviter = conn.execute(
-            "SELECT id FROM users WHERE id=?",
-            (referred_by,),
-        ).fetchone()
-
-        if inviter:
-
-            try:
-
-                conn.execute(
-                    """
-                    INSERT INTO referrals(
-                        inviter_id,
-                        invited_id,
-                        created_at
-                    )
-                    VALUES(?,?,?)
-                    """,
-                    (
-                        referred_by,
-                        user.id,
-                        datetime.utcnow().isoformat(),
-                    ),
-                )
-
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET chances=chances+1
-                    WHERE id=?
-                    """,
-                    (referred_by,),
-                )
-
-            except sqlite3.IntegrityError:
-                pass
-
-        conn.commit()
-        conn.close()
-
-    current = get_user(user.id)
-
-    if not current:
+    if not db_user:
         return
 
-    if not current["accepted_rules"]:
-
-        await update_or_send(
-            update,
-            """
-🎉 به محفل خوش‌شانس‌ها خوش آمدید!
-
-ثبت‌نام در محفل رایگان است.
-
-برای ادامه، ابتدا قوانین را مطالعه و تأیید کنید:
-            """,
-            rules_keyboard(),
-        )
-
-        return
-
-    await update_or_send(
-        update,
-        """
-🍀 خوش آمدی به محفل خوش‌شانس‌ها
-
-🎁 کمپین‌های رایگان
-🏆 جوایز
-👥 دعوت دوستان
-📊 پیگیری شانس‌ها
-
-از منوی زیر انتخاب کن:
-        """,
-        main_menu(),
-    )
-
-
-# =========================================================
-# UPDATE MESSAGE
-# =========================================================
-
-async def update_or_send(
-    update,
-    text,
-    keyboard=None,
-):
-
-    if update.callback_query:
-
-        try:
-
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=keyboard,
-            )
-
-        except Exception:
-
-            await update.callback_query.message.reply_text(
-                text,
-                reply_markup=keyboard,
-            )
-
-    else:
+    if not db_user["accepted_rules"]:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✅ مطالعه و پذیرش قوانین",
+                    callback_data="accept_rules"
+                )
+            ]
+        ])
 
         await update.message.reply_text(
-            text,
-            reply_markup=keyboard,
+            "🎉 به محفل خوش‌شانس‌ها خوش آمدید!\n\n"
+            "قبل از شروع، قوانین را مطالعه و تأیید کنید.\n\n"
+            "🎁 ثبت‌نام رایگان است.",
+            reply_markup=keyboard
         )
 
-
-# =========================================================
-# ACCEPT RULES
-# =========================================================
-
-async def accept_rules(update, context):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    version = current_rules_version()
-
-    conn = db()
-
-    conn.execute(
-        """
-        UPDATE users
-        SET accepted_rules=1,
-            rules_version=?
-        WHERE id=?
-        """,
-        (
-            version,
-            user_id,
-        ),
-    )
-
-    conn.execute(
-        """
-        INSERT INTO rule_acceptances(
-            user_id,
-            rules_version,
-            accepted_at
-        )
-        VALUES(?,?,?)
-        """,
-        (
-            user_id,
-            version,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    log_action(
-        user_id,
-        "accepted_rules",
-    )
-
-    await query.edit_message_text(
-        """
-✅ قوانین با موفقیت تأیید شد.
-
-ثبت‌نام شما رایگان است و می‌توانید
-در کمپین‌های فعال شرکت کنید.
-        """,
-        reply_markup=main_menu(),
-    )
-
-
-# =========================================================
-# PROFILE
-# =========================================================
-
-async def show_profile(update, context):
-
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    conn = db()
-
-    user = conn.execute(
-        "SELECT * FROM users WHERE id=?",
-        (user_id,),
-    ).fetchone()
-
-    referrals = conn.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM referrals
-        WHERE inviter_id=?
-        """,
-        (user_id,),
-    ).fetchone()["c"]
-
-    participated = conn.execute(
-        """
-        SELECT COUNT(DISTINCT campaign_id) AS c
-        FROM participations
-        WHERE user_id=?
-        """,
-        (user_id,),
-    ).fetchone()["c"]
-
-    conn.close()
-
-    if not user:
         return
 
-    text = f"""
-👤 پروفایل شما
-
-🆔 شناسه: {user_id}
-
-👤 نام: {user["first_name"] or "-"}
-
-📅 ثبت‌نام:
-{user["joined_at"][:10]}
-
-🍀 شانس‌ها:
-{user["chances"]:,}
-
-👥 دعوت موفق:
-{referrals:,}
-
-🎁 کمپین‌های شرکت‌کرده:
-{participated:,}
-"""
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_menu(),
+    await update.message.reply_text(
+        "🎉 خوش آمدی به محفل خوش‌شانس‌ها!\n\n"
+        "🎁 ثبت‌نام رایگان است.\n"
+        "👥 با دعوت دوستان شانس بیشتری می‌گیری.\n"
+        "🏆 با رسیدن شبکه به هدف ۱۰۰ هزار، قرعه‌کشی فعال می‌شود.",
+        reply_markup=main_menu()
     )
 
 
-# =========================================================
-# CHANCES
-# =========================================================
+# ============================================================
+# ACCEPT RULES
+# ============================================================
 
-async def show_chances(update, context):
-
+async def accept_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
     await query.answer()
 
-    user_id = query.from_user.id
-
-    conn = db()
-
-    user = conn.execute(
-        "SELECT chances FROM users WHERE id=?",
-        (user_id,),
-    ).fetchone()
-
-    conn.close()
-
-    chances = user["chances"] if user else 0
+    accept_rules(query.from_user.id)
 
     await query.edit_message_text(
-        f"""
-🍀 شانس‌های شما
-
-تعداد شانس‌های فعلی:
-🎟 {chances:,}
-
-هر دعوت موفق یک شانس رایگان
-برای شما ایجاد می‌کند.
-        """,
-        reply_markup=main_menu(),
+        "✅ قوانین با موفقیت پذیرفته شد.\n\n"
+        "به محفل خوش‌شانس‌ها خوش آمدی! 🎉\n\n"
+        "🎁 ثبت‌نام رایگان است.\n"
+        "👥 دوستانت را دعوت کن و شانس بیشتری بگیر.\n"
+        "🏆 قرعه‌کشی پس از رسیدن شبکه به هدف فعال می‌شود.",
+        reply_markup=main_menu()
     )
 
 
-# =========================================================
-# INVITE
-# =========================================================
-
-async def show_invite(update, context):
-
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    link = (
-        f"https://t.me/"
-        f"{BOT_USERNAME}"
-        f"?start=ref_{user_id}"
-    )
-
-    conn = db()
-
-    count = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM referrals
-        WHERE inviter_id=?
-        """,
-        (user_id,),
-    ).fetchone()[0]
-
-    conn.close()
-
-    await query.edit_message_text(
-        f"""
-👥 دعوت دوستان
-
-لینک اختصاصی شما:
-
-{link}
-
-👤 دعوت موفق:
-{count:,}
-
-🍀 هر دعوت موفق = ۱ شانس رایگان
-
-این لینک را برای دوستانت ارسال کن.
-        """,
-        reply_markup=main_menu(),
-    )
-
-
-# =========================================================
+# ============================================================
 # CAMPAIGNS
-# =========================================================
+# ============================================================
 
-async def show_campaigns(update, context):
-
+async def show_campaigns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
     await query.answer()
 
     if not lottery_is_active():
-
         await query.edit_message_text(
-            f"""
-🎁 کمپین‌های محفل
-
-فعلاً سیستم قرعه‌کشی هنوز به
-حدنصاب شبکه‌ها نرسیده است.
-
-{network_status_text()}
-            """,
-            reply_markup=main_menu(),
+            "⏳ قرعه‌کشی هنوز فعال نشده است.\n\n"
+            f"🎯 هدف فعال‌سازی: {activation_target():,}\n\n"
+            "برای باز شدن قرعه‌کشی باید شبکه‌های محفل "
+            "به حد تعیین‌شده برسند.\n\n"
+            + network_status_text(),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📢 عضویت تلگرام",
+                        url=TELEGRAM_URL
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="back_main"
+                    )
+                ]
+            ])
         )
-
         return
 
-    conn = db()
+    conn = db_connect()
 
-    campaigns = conn.execute(
-        """
+    rows = conn.execute("""
         SELECT *
         FROM campaigns
         WHERE status='active'
         ORDER BY id DESC
-        """
-    ).fetchall()
+    """).fetchall()
 
     conn.close()
 
-    if not campaigns:
-
+    if not rows:
         await query.edit_message_text(
-            """
-🎁 در حال حاضر کمپین فعالی وجود ندارد.
-
-به‌زودی کمپین‌های جدید اعلام می‌شوند.
-            """,
-            reply_markup=main_menu(),
+            "🎁 در حال حاضر مسابقه فعالی وجود ندارد.\n\n"
+            "به‌زودی مسابقات جدید اعلام می‌شود.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="back_main"
+                    )
+                ]
+            ])
         )
-
         return
 
     buttons = []
 
-    for campaign in campaigns:
-
+    for campaign in rows:
         buttons.append([
             InlineKeyboardButton(
                 f"🎁 {campaign['title']}",
-                callback_data=f"campaign_{campaign['id']}",
+                callback_data=f"campaign_{campaign['id']}"
             )
         ])
 
     buttons.append([
         InlineKeyboardButton(
             "🔙 بازگشت",
-            callback_data="home",
+            callback_data="back_main"
         )
     ])
 
     await query.edit_message_text(
-        """
-🎁 کمپین‌های فعال
-
-یکی از کمپین‌ها را انتخاب کن:
-        """,
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "🎁 مسابقات فعال\n\n"
+        "یک مسابقه را انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
-# =========================================================
-# CAMPAIGN DETAIL
-# =========================================================
-
-async def campaign_detail(update, context):
-
+async def show_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
     await query.answer()
 
-    campaign_id = int(
-        query.data.split("_")[1]
-    )
-
-    user_id = query.from_user.id
-
-    conn = db()
-
-    campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
-        (campaign_id,),
-    ).fetchone()
-
-    if not campaign:
-
-        conn.close()
-
-        await query.edit_message_text(
-            "❌ کمپین پیدا نشد.",
-            reply_markup=main_menu(),
+    try:
+        campaign_id = int(
+            query.data.split("_", 1)[1]
         )
-
+    except Exception:
         return
 
-    participant_count = conn.execute(
-        """
-        SELECT COUNT(DISTINCT user_id)
-        FROM participations
-        WHERE campaign_id=?
-        """,
-        (campaign_id,),
-    ).fetchone()[0]
+    conn = db_connect()
 
-    already = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM participations
-        WHERE campaign_id=?
-        AND user_id=?
-        """,
-        (
-            campaign_id,
-            user_id,
-        ),
-    ).fetchone()[0]
+    campaign = conn.execute(
+        "SELECT * FROM campaigns WHERE id=?",
+        (campaign_id,)
+    ).fetchone()
 
     conn.close()
 
-    sponsor_text = ""
-
-    if campaign["sponsor_name"]:
-
-        sponsor_text = (
-            f"\n🤝 اسپانسر: "
-            f"{campaign['sponsor_name']}"
+    if not campaign:
+        await query.edit_message_text(
+            "❌ مسابقه پیدا نشد.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="campaigns"
+                    )
+                ]
+            ])
         )
+        return
 
-    status = (
-        "✅ شما در این کمپین شرکت کرده‌اید."
-        if already
-        else "👇 برای شرکت رایگان کلیک کنید."
+    text = (
+        f"🎁 {campaign['title']}\n\n"
+        f"{campaign['description'] or ''}\n\n"
+        f"🏆 جایزه: {campaign['prize']}\n"
+        f"🎯 تعداد جوایز: {campaign['prize_count']}\n\n"
+        "📌 شرایط دریافت جایزه:\n"
+        "📢 عضویت در کانال تلگرام الزامی است.\n"
+        "📸 دنبال کردن اینستاگرام الزامی است.\n"
+        "▶️ دنبال کردن یوتیوب الزامی است.\n\n"
+        "⚠️ بررسی خودکار اینستاگرام و یوتیوب در نسخه فعلی "
+        "هنوز فعال نشده و در مرحله بعد اضافه خواهد شد."
     )
 
-    keyboard = []
-
-    if not already:
-
-        keyboard.append([
+    keyboard = InlineKeyboardMarkup([
+        [
             InlineKeyboardButton(
-                "🎟 شرکت رایگان در کمپین",
-                callback_data=(
-                    f"join_{campaign_id}"
-                ),
+                "🔐 بررسی شرایط شرکت",
+                callback_data="verify_membership"
             )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔙 بازگشت",
-            callback_data="campaigns",
-        )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎟 شرکت در مسابقه",
+                callback_data=f"join_{campaign_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 تلگرام",
+                url=TELEGRAM_URL
+            ),
+            InlineKeyboardButton(
+                "📸 اینستاگرام",
+                url=INSTAGRAM_URL
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "▶️ یوتیوب",
+                url=YOUTUBE_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 مسابقات",
+                callback_data="campaigns"
+            )
+        ]
     ])
-
-    text = f"""
-🎁 {campaign["title"]}
-
-{campaign["description"]}
-
-🏆 جایزه:
-{campaign["prize"]}
-
-🎁 تعداد جوایز:
-{campaign["prize_count"]}
-
-👥 شرکت‌کنندگان:
-{participant_count:,}
-
-📅 تاریخ قرعه‌کشی:
-{campaign["draw_date"] or "اعلام خواهد شد"}
-{sponsor_text}
-
-{status}
-"""
 
     await query.edit_message_text(
         text,
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        ),
+        reply_markup=keyboard
     )
 
 
-# =========================================================
+# ============================================================
 # JOIN CAMPAIGN
-# =========================================================
+# ============================================================
 
-async def join_campaign(update, context):
-
+async def join_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
     await query.answer()
+
+    try:
+        campaign_id = int(
+            query.data.split("_", 1)[1]
+        )
+    except Exception:
+        return
 
     user_id = query.from_user.id
 
-    campaign_id = int(
-        query.data.split("_")[1]
-    )
+    user = get_user(user_id)
 
-    conn = db()
-
-    user = conn.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE id=?
-        """,
-        (user_id,),
-    ).fetchone()
-
-    campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        AND status='active'
-        """,
-        (campaign_id,),
-    ).fetchone()
-
-    if not user or not campaign:
-
-        conn.close()
-
-        await query.answer(
-            "کمپین در دسترس نیست.",
-            show_alert=True,
+    if not user:
+        await query.edit_message_text(
+            "ابتدا /start را بزنید."
         )
-
         return
 
     if not user["accepted_rules"]:
-
-        conn.close()
-
-        await query.answer(
-            "ابتدا قوانین را تأیید کنید.",
-            show_alert=True,
+        await query.edit_message_text(
+            "ابتدا باید قوانین را بپذیرید.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📋 پذیرش قوانین",
+                        callback_data="accept_rules"
+                    )
+                ]
+            ])
         )
-
         return
 
-    exists = conn.execute(
-        """
-        SELECT COUNT(*)
+    if not lottery_is_active():
+        await query.edit_message_text(
+            "⏳ قرعه‌کشی هنوز فعال نشده است.\n\n"
+            "پس از رسیدن شبکه به هدف ۱۰۰ هزار، مسابقات فعال می‌شوند.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="campaigns"
+                    )
+                ]
+            ])
+        )
+        return
+
+    if TELEGRAM_MEMBERSHIP_REQUIRED:
+        is_member = await check_telegram_membership(
+            context.bot,
+            user_id
+        )
+
+        if not is_member:
+            await query.edit_message_text(
+                "❌ برای شرکت در مسابقه باید عضو کانال "
+                "محفل خوش‌شانس‌ها باشید.\n\n"
+                "📢 ابتدا عضو کانال شوید و سپس "
+                "«🔄 بررسی عضویت» را بزنید.",
+                reply_markup=eligibility_keyboard()
+            )
+            return
+
+    conn = db_connect()
+
+    campaign = conn.execute(
+        "SELECT * FROM campaigns WHERE id=? AND status='active'",
+        (campaign_id,)
+    ).fetchone()
+
+    if not campaign:
+        conn.close()
+
+        await query.edit_message_text(
+            "❌ این مسابقه دیگر فعال نیست.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 مسابقات",
+                        callback_data="campaigns"
+                    )
+                ]
+            ])
+        )
+        return
+
+    already = conn.execute("""
+        SELECT COUNT(*) AS count
         FROM participations
         WHERE campaign_id=?
         AND user_id=?
-        """,
-        (
-            campaign_id,
-            user_id,
-        ),
-    ).fetchone()[0]
+    """, (
+        campaign_id,
+        user_id
+    )).fetchone()["count"]
 
-    if exists:
-
+    if already:
         conn.close()
 
-        await query.answer(
-            "شما قبلاً در این کمپین شرکت کرده‌اید.",
-            show_alert=True,
+        await query.edit_message_text(
+            "⚠️ شما قبلاً در این مسابقه شرکت کرده‌اید.\n\n"
+            "هر شانس شما به صورت یک بلیت جداگانه در قرعه‌کشی ثبت شده است.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 مسابقات",
+                        callback_data="campaigns"
+                    )
+                ]
+            ])
         )
-
         return
 
     chances = max(
-        int(user["chances"]),
         1,
+        int(user["chances"] or 1)
     )
 
-    # ثبت تمام شانس‌های رایگان کاربر
-    for chance in range(1, chances + 1):
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO participations(
+    for number in range(1, chances + 1):
+        conn.execute("""
+            INSERT INTO participations(
                 campaign_id,
                 user_id,
                 chance_number,
                 created_at
             )
             VALUES(?,?,?,?)
-            """,
-            (
-                campaign_id,
-                user_id,
-                chance,
-                datetime.utcnow().isoformat(),
-            ),
-        )
+        """, (
+            campaign_id,
+            user_id,
+            number,
+            datetime.utcnow().isoformat()
+        ))
 
     conn.commit()
     conn.close()
 
-    log_action(
-        user_id,
-        f"joined_campaign={campaign_id}",
-    )
-
     await query.edit_message_text(
-        f"""
-✅ ثبت شد!
-
-شما با {chances:,} شانس رایگان
-در کمپین «{campaign["title"]}» شرکت کردید.
-
-🏆 جایزه:
-{campaign["prize"]}
-
-📅 قرعه‌کشی:
-{campaign["draw_date"] or "اعلام خواهد شد"}
-        """,
-        reply_markup=main_menu(),
+        "🎉 ثبت شرکت شما با موفقیت انجام شد!\n\n"
+        f"🎟 تعداد شانس‌های ثبت‌شده: {chances}\n\n"
+        "📢 توجه:\n"
+        "عضویت تلگرام و شرایط شبکه‌های اجتماعی برای دریافت "
+        "جایزه الزامی است.\n\n"
+        "👥 دوستان بیشتری دعوت کن تا شانس بیشتری داشته باشی.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "👥 دعوت دوستان",
+                    callback_data="invite"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 مسابقات",
+                    callback_data="campaigns"
+                )
+            ]
+        ])
     )
 
 
-# =========================================================
-# HISTORY
-# =========================================================
+# ============================================================
+# PROFILE
+# ============================================================
 
-async def show_history(update, context):
-
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
     await query.answer()
 
-    user_id = query.from_user.id
+    user = get_user(query.from_user.id)
 
-    conn = db()
+    if not user:
+        return
 
-    rows = conn.execute(
-        """
-        SELECT
-            c.title,
-            p.created_at
-        FROM participations p
-        JOIN campaigns c
-        ON c.id=p.campaign_id
-        WHERE p.user_id=?
-        GROUP BY c.id
-        ORDER BY p.created_at DESC
-        LIMIT 20
-        """,
-        (user_id,),
-    ).fetchall()
+    username = (
+        f"@{user['username']}"
+        if user["username"]
+        else "ندارد"
+    )
 
-    conn.close()
-
-    if not rows:
-
-        text = """
-📜 تاریخچه
-
-هنوز در هیچ کمپینی شرکت نکرده‌اید.
-"""
-
-    else:
-
-        text = "📜 تاریخچه شرکت شما\n\n"
-
-        for row in rows:
-
-            text += (
-                f"🎁 {row['title']}\n"
-                f"📅 {row['created_at'][:10]}\n\n"
-            )
+    text = (
+        "👤 پروفایل شما\n\n"
+        f"🆔 شناسه: {user['id']}\n"
+        f"👤 نام: {user['first_name'] or '-'}\n"
+        f"📱 نام کاربری: {username}\n"
+        f"🎟 شانس‌ها: {user['chances']}\n"
+        f"📅 عضویت: {user['joined_at'][:10]}\n\n"
+        "🎁 ثبت‌نام رایگان است."
+    )
 
     await query.edit_message_text(
         text,
-        reply_markup=main_menu(),
-    )
-
-
-# =========================================================
-# WINNERS
-# =========================================================
-
-async def show_winners(update, context):
-
-    query = update.callback_query
-    await query.answer()
-
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT
-            w.*,
-            c.title,
-            u.first_name,
-            u.username
-        FROM winners w
-        JOIN campaigns c
-        ON c.id=w.campaign_id
-        JOIN users u
-        ON u.id=w.user_id
-        ORDER BY w.selected_at DESC
-        LIMIT 30
-        """
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        text = """
-🏆 برندگان
-
-هنوز برنده‌ای ثبت نشده است.
-"""
-
-    else:
-
-        text = "🏆 آخرین برندگان\n\n"
-
-        for row in rows:
-
-            name = row["first_name"] or "کاربر"
-
-            text += (
-                f"🎁 {row['title']}\n"
-                f"👤 {name}\n"
-                f"🏆 {row['prize']}\n"
-                f"📅 {row['selected_at'][:10]}\n\n"
-            )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_menu(),
-    )
-
-
-# =========================================================
-# ARCHIVE
-# =========================================================
-
-async def show_archive(update, context):
-
-    query = update.callback_query
-    await query.answer()
-
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE status='closed'
-        ORDER BY id DESC
-        LIMIT 20
-        """
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        text = """
-🗄 آرشیو
-
-هنوز کمپین بسته‌شده‌ای وجود ندارد.
-"""
-
-    else:
-
-        text = "🗄 آرشیو کمپین‌ها\n\n"
-
-        for row in rows:
-
-            text += (
-                f"🎁 {row['title']}\n"
-                f"🏆 {row['prize']}\n"
-                f"📅 {row['draw_date'] or '-'}\n\n"
-            )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=main_menu(),
-    )
-
-
-# =========================================================
-# SUPPORT
-# =========================================================
-
-async def show_support(update, context):
-
-    query = update.callback_query
-    await query.answer()
-
-    await query.edit_message_text(
-        """
-🎧 پشتیبانی
-
-برای ارسال پیام به پشتیبانی،
-پیام خود را همینجا ارسال کنید.
-
-پیام شما برای تیم پشتیبانی ثبت خواهد شد.
-        """,
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "🔙 بازگشت",
-                    callback_data="home",
+                    callback_data="back_main"
                 )
             ]
-        ]),
-    )
-
-    context.user_data["waiting_support"] = True
-
-
-async def receive_support(update, context):
-
-    if not update.message:
-        return
-
-    user = update.effective_user
-
-    if not context.user_data.get(
-        "waiting_support"
-    ):
-        return
-
-    message = update.message.text
-
-    conn = db()
-
-    cur = conn.execute(
-        """
-        INSERT INTO support_tickets(
-            user_id,
-            message,
-            created_at
-        )
-        VALUES(?,?,?)
-        """,
-        (
-            user.id,
-            message,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-
-    ticket_id = cur.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    context.user_data["waiting_support"] = False
-
-    for admin_id in ADMIN_IDS:
-
-        try:
-
-            await context.bot.send_message(
-                admin_id,
-                f"""
-🎧 تیکت جدید
-
-شماره: #{ticket_id}
-
-کاربر:
-{user.first_name or "-"}
-
-ID:
-{user.id}
-
-پیام:
-{message}
-
-برای پاسخ:
- /reply {ticket_id} متن پاسخ
-                """,
-            )
-
-        except Exception:
-            pass
-
-    await update.message.reply_text(
-        """
-✅ پیام شما ثبت شد.
-
-تیم پشتیبانی پس از بررسی پاسخ خواهد داد.
-        """,
-        reply_markup=main_menu(),
+        ])
     )
 
 
-# =========================================================
-# RULES CALLBACK
-# =========================================================
+# ============================================================
+# CHANCES
+# ============================================================
 
-async def show_rules(update, context):
-
+async def show_chances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
     await query.answer()
 
+    user = get_user(query.from_user.id)
+
+    chances = user["chances"] if user else 0
+
+    conn = db_connect()
+
+    participated = conn.execute("""
+        SELECT COUNT(DISTINCT campaign_id) AS count
+        FROM participations
+        WHERE user_id=?
+    """, (
+        query.from_user.id,
+    )).fetchone()["count"]
+
+    conn.close()
+
     await query.edit_message_text(
-        rules_text(),
+        "🎟 شانس‌های شما\n\n"
+        f"🎟 تعداد شانس فعلی: {chances}\n"
+        f"🎁 مسابقات شرکت‌کرده: {participated}\n\n"
+        "👥 با دعوت دوستان می‌توانی شانس بیشتری بگیری.",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    "✅ قبول قوانین",
-                    callback_data="accept_rules",
+                    "👥 دعوت دوستان",
+                    callback_data="invite"
                 )
             ],
             [
                 InlineKeyboardButton(
                     "🔙 بازگشت",
-                    callback_data="home",
+                    callback_data="back_main"
                 )
             ]
-        ]),
+        ])
     )
 
 
-# =========================================================
-# HOME
-# =========================================================
+# ============================================================
+# INVITE
+# ============================================================
 
-async def home(update, context):
-
+async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    invite_link = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start=ref_{user_id}"
+    )
+
+    conn = db_connect()
+
+    count = conn.execute("""
+        SELECT COUNT(*)
+        FROM referrals
+        WHERE inviter_id=?
+    """, (
+        user_id,
+    )).fetchone()[0]
+
+    conn.close()
+
+    text = (
+        "👥 دعوت دوستان\n\n"
+        "دوستانت را به محفل خوش‌شانس‌ها دعوت کن.\n\n"
+        "🎟 هر دعوت موفق یک شانس اضافه برای دعوت‌کننده ایجاد می‌کند.\n\n"
+        f"👥 تعداد دعوت‌های موفق: {count}\n\n"
+        "🔗 لینک اختصاصی شما:\n"
+        f"{invite_link}\n\n"
+        "🎁 ثبت‌نام رایگان است."
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📤 اشتراک‌گذاری لینک",
+                    url=(
+                        "https://t.me/share/url?"
+                        + urlencode({
+                            "url": invite_link,
+                            "text": "🎁 به محفل خوش‌شانس‌ها بپیوند!"
+                        })
+                    )
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 بازگشت",
+                    callback_data="back_main"
+                )
+            ]
+        ])
+    )
+
+
+# ============================================================
+# WINNERS
+# ============================================================
+
+async def show_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    await query.answer()
+
+    conn = db_connect()
+
+    rows = conn.execute("""
+        SELECT
+            winners.*,
+            users.first_name,
+            users.username,
+            campaigns.title
+        FROM winners
+        LEFT JOIN users
+            ON users.id=winners.user_id
+        LEFT JOIN campaigns
+            ON campaigns.id=winners.campaign_id
+        WHERE winners.announced=1
+        ORDER BY winners.id DESC
+        LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    if not rows:
+        text = (
+            "🏆 هنوز برنده‌ای اعلام نشده است.\n\n"
+            "اولین برندگان به‌زودی در همین بخش اعلام خواهند شد."
+        )
+    else:
+        lines = ["🏆 برندگان محفل خوش‌شانس‌ها\n"]
+
+        for row in rows:
+            name = row["first_name"] or "کاربر"
+
+            if row["username"]:
+                name += f" (@{row['username']})"
+
+            lines.append(
+                f"🎁 {row['title']}\n"
+                f"👤 {name}\n"
+                f"🏆 {row['prize']}\n"
+            )
+
+        text = "\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 بازگشت",
+                    callback_data="back_main"
+                )
+            ]
+        ])
+    )
+
+
+# ============================================================
+# ARCHIVE
+# ============================================================
+
+async def show_archive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    await query.answer()
+
+    conn = db_connect()
+
+    rows = conn.execute("""
+        SELECT *
+        FROM campaigns
+        WHERE status='closed'
+        ORDER BY id DESC
+        LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    if not rows:
+        text = "📜 هنوز آرشیوی ثبت نشده است."
+    else:
+        lines = ["📜 آرشیو مسابقات\n"]
+
+        for row in rows:
+            lines.append(
+                f"🎁 {row['title']}\n"
+                f"🏆 {row['prize']}\n"
+                f"📅 {row['draw_date'] or '-'}\n"
+            )
+
+        text = "\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 بازگشت",
+                    callback_data="back_main"
+                )
+            ]
+        ])
+    )
+
+
+# ============================================================
+# RULES SCREEN
+# ============================================================
+
+async def show_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
     await query.answer()
 
     await query.edit_message_text(
-        """
-🍀 محفل خوش‌شانس‌ها
-
-🎁 کمپین‌های رایگان
-🏆 جوایز
-👥 دعوت دوستان
-🤝 همکاری با برندها
-
-انتخاب کن:
-        """,
-        reply_markup=main_menu(),
+        RULES_TEXT,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 بازگشت",
+                    callback_data="back_main"
+                )
+            ]
+        ])
     )
 
 
-# =========================================================
-# ADMIN PANEL
-# =========================================================
+# ============================================================
+# SUPPORT
+# ============================================================
 
-async def admin_panel(update, context):
+async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
 
-    if not await admin_required(update):
+    await query.answer()
+
+    context.user_data["support_mode"] = True
+
+    await query.edit_message_text(
+        "🎧 پشتیبانی محفل خوش‌شانس‌ها\n\n"
+        "پیام خود را همینجا ارسال کنید.\n\n"
+        "اگر اسپانسر هستید، مشخصات و پیشنهاد همکاری خود را "
+        "ارسال کنید تا تیم پشتیبانی بررسی کند.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 بازگشت",
+                    callback_data="back_main"
+                )
+            ]
+        ])
+    )
+
+
+async def receive_support_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not context.user_data.get("support_mode"):
+        return False
+
+    if not update.message:
+        return False
+
+    message = update.message.text.strip()
+
+    if not message:
+        return True
+
+    user_id = update.effective_user.id
+
+    conn = db_connect()
+
+    cursor = conn.execute("""
+        INSERT INTO support_tickets(
+            user_id,
+            message,
+            status,
+            created_at
+        )
+        VALUES(?,?,?,?)
+    """, (
+        user_id,
+        message,
+        "open",
+        datetime.utcnow().isoformat()
+    ))
+
+    ticket_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    context.user_data["support_mode"] = False
+
+    await update.message.reply_text(
+        f"✅ پیام شما ثبت شد.\n\n"
+        f"🎫 شماره تیکت: #{ticket_id}\n\n"
+        "پشتیبانی پیام شما را بررسی می‌کند.",
+        reply_markup=main_menu()
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                "🎧 تیکت جدید\n\n"
+                f"🎫 شماره: #{ticket_id}\n"
+                f"👤 کاربر: {user_id}\n\n"
+                f"💬 پیام:\n{message}\n\n"
+                f"برای پاسخ:\n"
+                f"/reply {ticket_id} متن پاسخ"
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not notify admin %s: %s",
+                admin_id,
+                e
+            )
+
+    return True
+
+
+# ============================================================
+# CALLBACK ROUTER
+# ============================================================
+
+async def callback_router(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+
+    if not query:
+        return
+
+    data = query.data or ""
+
+    if data == "accept_rules":
+        await accept_rules(update, context)
+        return
+
+    if data == "verify_membership":
+        await verify_membership(update, context)
+        return
+
+    if data == "campaigns":
+        await show_campaigns(update, context)
+        return
+
+    if data.startswith("campaign_"):
+        await show_campaign(update, context)
+        return
+
+    if data.startswith("join_"):
+        await join_campaign(update, context)
+        return
+
+    if data == "profile":
+        await show_profile(update, context)
+        return
+
+    if data == "chances":
+        await show_chances(update, context)
+        return
+
+    if data == "invite":
+        await show_invite(update, context)
+        return
+
+    if data == "winners":
+        await show_winners(update, context)
+        return
+
+    if data == "archive":
+        await show_archive(update, context)
+        return
+
+    if data == "rules":
+        await show_rules(update, context)
+        return
+
+    if data == "support":
+        await show_support(update, context)
+        return
+
+    if data == "back_main":
+        await query.answer()
+
+        await query.edit_message_text(
+            "🏠 منوی اصلی",
+            reply_markup=main_menu()
+        )
+        return
+
+    await query.answer()
+
+
+# ============================================================
+# TEXT MESSAGE HANDLER
+# ============================================================
+
+async def text_message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    handled = await receive_support_message(
+        update,
+        context
+    )
+
+    if handled:
+        return
+
+    if update.message:
+        await update.message.reply_text(
+            "از منوی زیر استفاده کنید:",
+            reply_markup=main_menu()
+        )
+
+
+# ============================================================
+# ADMIN CHECK
+# ============================================================
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+# ============================================================
+# ADMIN MENU
+# ============================================================
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     await update.message.reply_text(
-        """
-🛠 پنل مدیریت محفل
-
-📊 آمار:
-/stats
-
-📈 وضعیت شبکه:
-/network
-
-📸 تعداد اینستاگرام:
-/igfollowers 100000
-
-▶️ تعداد یوتیوب:
-/ytfollowers 100000
-
-📢 تعداد تلگرام:
-/tgfollowers 100000
-
-🎯 حدنصاب:
-/activation 100000
-
-👥 سقف برنامه:
-/maxfollowers 1000000
-
-💰 بودجه اسپانسر:
-/sponsorbudget 500000000
-
-🎁 جایزه:
-/dailyprize 10000000
-
-📋 قوانین:
-/rulesadmin 1.1
-
-➕ ساخت کمپین:
-/newcampaign
-
-🤝 افزودن اسپانسر:
-/newsponsor
-
-🎲 قرعه‌کشی:
-/draw CAMPAIGN_ID
-
-🏆 اعلام برنده:
-/announce CAMPAIGN_ID
-
-📣 ارسال پیام:
-/broadcast متن
-
-📋 کاربران:
-/users
-
-🎫 تعداد شرکت‌کنندگان:
-/participants CAMPAIGN_ID
-
-🎧 تیکت‌ها:
-/tickets
-
-📜 لاگ:
-/logs
-        """
+        "🛠 پنل مدیریت\n\n"
+        "/stats\n"
+        "/network\n"
+        "/igfollowers 100000\n"
+        "/ytfollowers 100000\n"
+        "/tgfollowers 100000\n"
+        "/activation 100000\n"
+        "/maxfollowers 1000000\n"
+        "/dailyprize 10000000\n"
+        "/newcampaign عنوان | توضیحات | جایزه\n"
+        "/newsponsor نام | تلفن | بودجه | توضیحات\n"
+        "/sponsorbudget مبلغ\n"
+        "/draw ID\n"
+        "/announce ID\n"
+        "/rulesadmin متن\n"
+        "/users\n"
+        "/participants ID\n"
+        "/tickets\n"
+        "/reply ID متن\n"
+        "/broadcast متن\n"
+        "/postnow\n"
+        "/logs"
     )
 
 
-# =========================================================
+# ============================================================
 # ADMIN STATS
-# =========================================================
+# ============================================================
 
-async def stats(update, context):
-
-    if not await admin_required(update):
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
-    conn = db()
+    conn = db_connect()
 
     users = conn.execute(
         "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
+    active_users = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE is_active=1"
     ).fetchone()[0]
 
     referrals = conn.execute(
@@ -1913,55 +1759,43 @@ async def stats(update, context):
     ).fetchone()[0]
 
     active_campaigns = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM campaigns
-        WHERE status='active'
-        """
+        "SELECT COUNT(*) FROM campaigns WHERE status='active'"
     ).fetchone()[0]
 
-    participants = conn.execute(
+    participations = conn.execute(
         "SELECT COUNT(*) FROM participations"
     ).fetchone()[0]
 
-    sponsors = conn.execute(
-        "SELECT COUNT(*) FROM sponsors"
+    winners = conn.execute(
+        "SELECT COUNT(*) FROM winners"
+    ).fetchone()[0]
+
+    tickets = conn.execute(
+        "SELECT COUNT(*) FROM support_tickets WHERE status='open'"
     ).fetchone()[0]
 
     conn.close()
 
     await update.message.reply_text(
-        f"""
-📊 آمار محفل
-
-👥 کاربران:
-{users:,}
-
-👥 دعوت‌های موفق:
-{referrals:,}
-
-🎁 کل کمپین‌ها:
-{campaigns:,}
-
-🟢 کمپین‌های فعال:
-{active_campaigns:,}
-
-🎟 رکوردهای شرکت:
-{participants:,}
-
-🤝 اسپانسرها:
-{sponsors:,}
-        """
+        "📊 آمار سیستم\n\n"
+        f"👥 کل کاربران: {users:,}\n"
+        f"🟢 کاربران فعال: {active_users:,}\n"
+        f"👥 دعوت‌ها: {referrals:,}\n"
+        f"🎁 کل مسابقات: {campaigns:,}\n"
+        f"🎯 مسابقات فعال: {active_campaigns:,}\n"
+        f"🎟 مشارکت‌ها: {participations:,}\n"
+        f"🏆 برندگان: {winners:,}\n"
+        f"🎧 تیکت‌های باز: {tickets:,}\n\n"
+        + network_status_text()
     )
 
 
-# =========================================================
-# NETWORK ADMIN
-# =========================================================
+# ============================================================
+# ADMIN NETWORK
+# ============================================================
 
-async def network(update, context):
-
-    if not await admin_required(update):
+async def network(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     await update.message.reply_text(
@@ -1969,441 +1803,234 @@ async def network(update, context):
     )
 
 
-async def set_instagram_followers(
-    update,
-    context,
-):
-
-    if not await admin_required(update):
+async def igfollowers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
             "مثال:\n/igfollowers 100000"
         )
-
         return
 
     try:
-
-        count = int(
-            context.args[0].replace(",", "")
-        )
-
-        if count < 0:
-            raise ValueError
-
-    except Exception:
-
+        value = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح وارد کن."
+            "عدد صحیح وارد کنید."
         )
-
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
+    set_setting(
         "instagram_followers",
-        count,
+        value
     )
 
-    if not all_networks_reached(conn):
-
-        setting_set(
-            conn,
-            "networks_activated",
-            0,
-        )
-
-    conn.commit()
-    conn.close()
-
-    log_action(
+    log_operation(
         update.effective_user.id,
-        f"instagram_followers={count}",
+        "igfollowers",
+        str(value)
     )
 
     await update.message.reply_text(
-        f"""
-✅ Instagram روی {count:,} تنظیم شد.
-
-{network_status_text()}
-        """
+        f"✅ تعداد اینستاگرام روی {value:,} تنظیم شد.\n\n"
+        + network_status_text()
     )
 
 
-async def set_youtube_followers(
-    update,
-    context,
-):
-
-    if not await admin_required(update):
+async def ytfollowers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
             "مثال:\n/ytfollowers 100000"
         )
-
         return
 
     try:
-
-        count = int(
-            context.args[0].replace(",", "")
-        )
-
-        if count < 0:
-            raise ValueError
-
-    except Exception:
-
+        value = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح وارد کن."
+            "عدد صحیح وارد کنید."
         )
-
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
+    set_setting(
         "youtube_followers",
-        count,
+        value
     )
 
-    if not all_networks_reached(conn):
-
-        setting_set(
-            conn,
-            "networks_activated",
-            0,
-        )
-
-    conn.commit()
-    conn.close()
-
-    log_action(
+    log_operation(
         update.effective_user.id,
-        f"youtube_followers={count}",
+        "ytfollowers",
+        str(value)
     )
 
     await update.message.reply_text(
-        f"""
-✅ YouTube روی {count:,} تنظیم شد.
-
-{network_status_text()}
-        """
+        f"✅ تعداد یوتیوب روی {value:,} تنظیم شد.\n\n"
+        + network_status_text()
     )
 
 
-async def set_telegram_followers(
-    update,
-    context,
-):
-
-    if not await admin_required(update):
+async def tgfollowers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
             "مثال:\n/tgfollowers 100000"
         )
-
         return
 
     try:
-
-        count = int(
-            context.args[0].replace(",", "")
-        )
-
-        if count < 0:
-            raise ValueError
-
-    except Exception:
-
+        value = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح وارد کن."
+            "عدد صحیح وارد کنید."
         )
-
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
+    set_setting(
         "telegram_followers",
-        count,
+        value
     )
 
-    if not all_networks_reached(conn):
-
-        setting_set(
-            conn,
-            "networks_activated",
-            0,
-        )
-
-    conn.commit()
-    conn.close()
+    log_operation(
+        update.effective_user.id,
+        "tgfollowers",
+        str(value)
+    )
 
     await update.message.reply_text(
-        f"""
-✅ Telegram روی {count:,} تنظیم شد.
-
-{network_status_text()}
-        """
+        f"✅ تعداد تلگرام روی {value:,} تنظیم شد.\n\n"
+        + network_status_text()
     )
 
 
-async def activation(update, context):
-
-    if not await admin_required(update):
+async def activation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
-            "مثال:\n/activation 100000"
+            f"🎯 مقدار فعلی: {activation_target():,}\n\n"
+            "برای تغییر:\n"
+            "/activation 100000"
         )
-
         return
 
     try:
-        count = int(context.args[0])
-    except:
+        value = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح وارد کن."
+            "عدد صحیح وارد کنید."
         )
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
+    set_setting(
         "activation_followers",
-        count,
+        value
     )
 
-    conn.commit()
-    conn.close()
+    log_operation(
+        update.effective_user.id,
+        "activation",
+        str(value)
+    )
 
     await update.message.reply_text(
-        network_status_text()
+        f"✅ هدف فعال‌سازی روی {value:,} تنظیم شد."
     )
 
 
-async def maxfollowers(update, context):
-
-    if not await admin_required(update):
+async def maxfollowers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
         await update.message.reply_text(
-            "مثال:\n/maxfollowers 1000000"
+            f"حد فعلی: {get_setting('plan_max_followers', '1000000')}"
         )
         return
 
     try:
-        count = int(context.args[0])
-    except:
+        value = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح."
+            "عدد صحیح وارد کنید."
         )
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
+    set_setting(
         "plan_max_followers",
-        count,
+        value
     )
-
-    conn.commit()
-    conn.close()
 
     await update.message.reply_text(
-        f"✅ سقف برنامه روی {count:,} تنظیم شد."
+        f"✅ سقف شبکه روی {value:,} تنظیم شد."
     )
 
 
-# =========================================================
-# SPONSOR ADMIN
-# =========================================================
-
-async def new_sponsor(update, context):
-
-    if not await admin_required(update):
-        return
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            """
-مثال:
-
-/newsponsor شرکت ایرانسل 500000000
-            """
-        )
-
-        return
-
-    name = context.args[0]
-
-    try:
-        budget = int(
-            context.args[1].replace(",", "")
-        )
-    except:
-        await update.message.reply_text(
-            "❌ بودجه باید عدد باشد."
-        )
-        return
-
-    conn = db()
-
-    conn.execute(
-        """
-        INSERT INTO sponsors(
-            name,
-            budget,
-            created_at
-        )
-        VALUES(?,?,?)
-        """,
-        (
-            name,
-            budget,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-
-    total = int(
-        setting_get(
-            conn,
-            "total_sponsor_budget",
-            "0",
-        )
-    )
-
-    setting_set(
-        conn,
-        "total_sponsor_budget",
-        total + budget,
-    )
-
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"""
-✅ اسپانسر ثبت شد.
-
-🤝 {name}
-💰 بودجه: {budget:,} تومان
-        """
-    )
-
-
-async def sponsor_budget(update, context):
-
-    if not await admin_required(update):
+async def dailyprize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
-            "مثال:\n/sponsorbudget 500000000"
+            f"مبلغ فعلی: {get_setting('daily_prize_amount')}"
         )
-
         return
 
     try:
-        amount = int(
-            context.args[0].replace(",", "")
-        )
-    except:
+        value = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح."
+            "عدد صحیح وارد کنید."
         )
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
-        "total_sponsor_budget",
-        amount,
+    set_setting(
+        "daily_prize_amount",
+        value
     )
-
-    conn.commit()
-    conn.close()
 
     await update.message.reply_text(
-        f"🤝 بودجه اسپانسرها: {amount:,} تومان"
+        f"✅ مبلغ جایزه تنظیم شد: {value:,}"
     )
 
 
-# =========================================================
-# CAMPAIGN CREATION
-# =========================================================
+# ============================================================
+# ADMIN NEW CAMPAIGN
+# ============================================================
 
-async def new_campaign(update, context):
-
-    if not await admin_required(update):
-        return
-
-    if len(context.args) < 4:
-
-        await update.message.reply_text(
-            """
-ساخت کمپین:
-
-/newcampaign عنوان | توضیح | جایزه | تاریخ
-
-مثال:
-
-/newcampaign
-قرعه‌کشی شهریور |
-۱۰ جایزه برای کاربران |
-هر جایزه ۱۰ میلیون تومان |
-1405/07/01
-            """
-        )
-
+async def newcampaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     raw = " ".join(context.args)
 
     parts = [
-        x.strip()
-        for x in raw.split("|")
+        part.strip()
+        for part in raw.split("|")
     ]
 
-    if len(parts) < 4:
-
+    if len(parts) < 3:
         await update.message.reply_text(
-            "❌ اطلاعات را با | جدا کن."
+            "فرمت:\n\n"
+            "/newcampaign عنوان | توضیحات | جایزه\n\n"
+            "مثال:\n"
+            "/newcampaign قرعه بزرگ | جایزه ویژه | 10000000 تومان"
         )
-
         return
 
     title = parts[0]
     description = parts[1]
     prize = parts[2]
-    draw_date = parts[3]
 
-    conn = db()
+    conn = db_connect()
 
-    conn.execute(
-        """
+    cursor = conn.execute("""
         INSERT INTO campaigns(
             title,
             description,
@@ -2414,803 +2041,1115 @@ async def new_campaign(update, context):
             created_at
         )
         VALUES(?,?,?,?,?,?,?)
-        """,
-        (
-            title,
+    """, (
+        title,
+        description,
+        prize,
+        1,
+        None,
+        "active",
+        datetime.utcnow().isoformat()
+    ))
+
+    campaign_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    log_operation(
+        update.effective_user.id,
+        "newcampaign",
+        str(campaign_id)
+    )
+
+    await update.message.reply_text(
+        f"✅ مسابقه ساخته شد.\n\n"
+        f"🆔 ID: {campaign_id}\n"
+        f"🎁 {title}\n"
+        f"🏆 {prize}"
+    )
+
+
+# ============================================================
+# SPONSORS
+# ============================================================
+
+async def newsponsor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    raw = " ".join(context.args)
+
+    parts = [
+        part.strip()
+        for part in raw.split("|")
+    ]
+
+    if len(parts) < 4:
+        await update.message.reply_text(
+            "فرمت:\n"
+            "/newsponsor نام | تلفن | بودجه | توضیحات"
+        )
+        return
+
+    name = parts[0]
+    phone = parts[1]
+
+    try:
+        budget = float(parts[2])
+    except ValueError:
+        budget = 0
+
+    description = parts[3]
+
+    conn = db_connect()
+
+    cursor = conn.execute("""
+        INSERT INTO sponsors(
+            name,
+            phone,
+            budget,
             description,
-            prize,
-            1,
-            draw_date,
-            "active",
-            datetime.utcnow().isoformat(),
-        ),
-    )
+            created_at
+        )
+        VALUES(?,?,?,?,?)
+    """, (
+        name,
+        phone,
+        budget,
+        description,
+        datetime.utcnow().isoformat()
+    ))
+
+    sponsor_id = cursor.lastrowid
+
+    conn.execute("""
+        UPDATE settings
+        SET value = CAST(value AS REAL) + ?
+        WHERE key='total_sponsor_budget'
+    """, (budget,))
 
     conn.commit()
     conn.close()
 
     await update.message.reply_text(
-        f"""
-✅ کمپین ساخته شد.
-
-🎁 {title}
-🏆 {prize}
-📅 {draw_date}
-        """
+        f"✅ اسپانسر ثبت شد.\n\n"
+        f"🆔 ID: {sponsor_id}\n"
+        f"👤 {name}\n"
+        f"💰 بودجه: {budget:,.0f}"
     )
 
 
-# =========================================================
-# DAILY PRIZE
-# =========================================================
-
-async def daily_prize(update, context):
-
-    if not await admin_required(update):
+async def sponsorbudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
-        await update.message.reply_text(
-            "مثال:\n/dailyprize 10000000"
+        total = get_setting(
+            "total_sponsor_budget",
+            "0"
         )
 
+        await update.message.reply_text(
+            f"💰 مجموع بودجه اسپانسرها: {float(total):,.0f}"
+        )
         return
 
     try:
-        amount = int(
-            context.args[0].replace(",", "")
-        )
-    except:
+        value = float(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ عدد صحیح."
+            "مبلغ صحیح وارد کنید."
         )
         return
 
-    conn = db()
-
-    setting_set(
-        conn,
-        "daily_prize_amount",
-        amount,
+    set_setting(
+        "total_sponsor_budget",
+        value
     )
-
-    conn.commit()
-    conn.close()
 
     await update.message.reply_text(
-        f"🎁 مبلغ پایه جایزه: {amount:,} تومان"
+        f"✅ بودجه کل اسپانسرها: {value:,.0f}"
     )
 
 
-# =========================================================
-# RULE ADMIN
-# =========================================================
+# ============================================================
+# DRAW HELPERS
+# ============================================================
 
-async def rules_admin(update, context):
+async def get_eligible_tickets(
+    bot,
+    campaign_id,
+    excluded_users=None
+):
+    excluded_users = excluded_users or set()
 
-    if not await admin_required(update):
-        return
+    conn = db_connect()
 
-    if not context.args:
-
-        await update.message.reply_text(
-            f"نسخه فعلی: {current_rules_version()}"
-        )
-
-        return
-
-    version = context.args[0]
-
-    conn = db()
-
-    setting_set(
-        conn,
-        "rules_version",
-        version,
-    )
-
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        f"✅ نسخه قوانین شد: {version}"
-    )
-
-
-# =========================================================
-# DRAW
-# =========================================================
-
-async def draw_campaign(update, context):
-
-    if not await admin_required(update):
-        return
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "مثال:\n/draw 1"
-        )
-
-        return
-
-    try:
-        campaign_id = int(
-            context.args[0]
-        )
-    except:
-
-        await update.message.reply_text(
-            "❌ شناسه کمپین اشتباه است."
-        )
-
-        return
-
-    conn = db()
-
-    campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
-        (campaign_id,),
-    ).fetchone()
-
-    if not campaign:
-
-        conn.close()
-
-        await update.message.reply_text(
-            "❌ کمپین پیدا نشد."
-        )
-
-        return
-
-    rows = conn.execute(
-        """
+    rows = conn.execute("""
         SELECT
             p.user_id,
             p.chance_number
         FROM participations p
         WHERE p.campaign_id=?
-        """,
-        (campaign_id,),
-    ).fetchall()
+        ORDER BY p.id ASC
+    """, (
+        campaign_id,
+    )).fetchall()
 
-    if not rows:
+    conn.close()
 
+    eligible_tickets = []
+    checked_users = {}
+
+    for row in rows:
+        user_id = row["user_id"]
+
+        if user_id in excluded_users:
+            continue
+
+        if user_id not in checked_users:
+            checked_users[user_id] = await check_telegram_membership(
+                bot,
+                user_id
+            )
+
+        if checked_users[user_id]:
+            eligible_tickets.append(user_id)
+
+    return eligible_tickets
+
+
+# ============================================================
+# ADMIN DRAW
+# ============================================================
+
+async def draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "مثال:\n/draw 1"
+        )
+        return
+
+    try:
+        campaign_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "ID صحیح وارد کنید."
+        )
+        return
+
+    conn = db_connect()
+
+    campaign = conn.execute(
+        "SELECT * FROM campaigns WHERE id=?",
+        (campaign_id,)
+    ).fetchone()
+
+    if not campaign:
         conn.close()
 
         await update.message.reply_text(
-            "❌ هیچ شرکت‌کننده‌ای وجود ندارد."
+            "❌ مسابقه پیدا نشد."
         )
-
         return
 
-    # وزن‌دهی بر اساس شانس‌های رایگان
-    tickets = []
+    if campaign["status"] != "active":
+        conn.close()
 
-    for row in rows:
-
-        tickets.append(
-            row["user_id"]
+        await update.message.reply_text(
+            "❌ این مسابقه فعال نیست."
         )
+        return
 
-    winner_id = random.choice(
-        tickets
+    conn.close()
+
+    eligible_tickets = await get_eligible_tickets(
+        context.bot,
+        campaign_id
     )
 
-    conn.execute(
-        """
+    if not eligible_tickets:
+        await update.message.reply_text(
+            "❌ هیچ شرکت‌کننده واجد شرایطی پیدا نشد.\n\n"
+            "بررسی شد که شرکت‌کننده باید عضو کانال تلگرام باشد."
+        )
+        return
+
+    winner_id = random.choice(
+        eligible_tickets
+    )
+
+    conn = db_connect()
+
+    conn.execute("""
         INSERT INTO winners(
             campaign_id,
             user_id,
             prize,
-            selected_at
+            selected_at,
+            announced
         )
-        VALUES(?,?,?,?)
-        """,
-        (
-            campaign_id,
-            winner_id,
-            campaign["prize"],
-            datetime.utcnow().isoformat(),
-        ),
-    )
+        VALUES(?,?,?,?,?)
+    """, (
+        campaign_id,
+        winner_id,
+        campaign["prize"],
+        datetime.utcnow().isoformat(),
+        0
+    ))
 
-    conn.execute(
-        """
+    conn.execute("""
         UPDATE campaigns
-        SET status='closed'
+        SET status='closed',
+            draw_date=?
         WHERE id=?
-        """,
-        (campaign_id,),
-    )
+    """, (
+        datetime.utcnow().isoformat(),
+        campaign_id
+    ))
 
     conn.commit()
     conn.close()
 
-    log_action(
+    log_operation(
         update.effective_user.id,
-        f"draw_campaign={campaign_id};winner={winner_id}",
+        "draw",
+        f"campaign={campaign_id},winner={winner_id}"
     )
 
     await update.message.reply_text(
-        f"""
-🎲 قرعه‌کشی انجام شد.
-
-🎁 کمپین:
-{campaign["title"]}
-
-🏆 جایزه:
-{campaign["prize"]}
-
-👤 شناسه برنده:
-{winner_id}
-
-برای اعلام عمومی:
- /announce {campaign_id}
-        """
+        "🎉 قرعه‌کشی انجام شد.\n\n"
+        f"🎁 مسابقه: {campaign['title']}\n"
+        f"👤 شناسه برنده: {winner_id}\n\n"
+        "⚠️ وضعیت عضویت در تلگرام هنگام قرعه‌کشی بررسی شد.\n"
+        "برای اعلام عمومی از /announce استفاده کنید."
     )
 
 
-# =========================================================
-# ANNOUNCE WINNER
-# =========================================================
+# ============================================================
+# ADMIN ANNOUNCE
+# ============================================================
 
-async def announce_winner(update, context):
-
-    if not await admin_required(update):
+async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
             "مثال:\n/announce 1"
         )
-
         return
 
     try:
-        campaign_id = int(
-            context.args[0]
-        )
-    except:
-
+        campaign_id = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ شناسه اشتباه."
+            "ID صحیح وارد کنید."
         )
-
         return
 
-    conn = db()
+    conn = db_connect()
 
-    row = conn.execute(
-        """
+    winner = conn.execute("""
         SELECT
-            w.*,
-            c.title,
-            c.prize,
-            u.first_name,
-            u.username
-        FROM winners w
-        JOIN campaigns c
-        ON c.id=w.campaign_id
-        JOIN users u
-        ON u.id=w.user_id
-        WHERE w.campaign_id=?
-        ORDER BY w.id DESC
+            winners.*,
+            campaigns.title
+        FROM winners
+        JOIN campaigns
+            ON campaigns.id=winners.campaign_id
+        WHERE winners.campaign_id=?
+        AND winners.announced=0
+        ORDER BY winners.id DESC
         LIMIT 1
-        """,
-        (campaign_id,),
-    ).fetchone()
+    """, (
+        campaign_id,
+    )).fetchone()
 
-    if not row:
+    conn.close()
 
+    if not winner:
+        await update.message.reply_text(
+            "❌ برنده‌ای برای اعلام پیدا نشد."
+        )
+        return
+
+    # بررسی دوباره عضویت قبل از اعلام جایزه
+    still_member = await check_telegram_membership(
+        context.bot,
+        winner["user_id"]
+    )
+
+    if not still_member:
+        await update.message.reply_text(
+            "⚠️ برنده فعلی در زمان اعلام دیگر عضو کانال نیست.\n\n"
+            "❌ جایزه برای این شخص تأیید نمی‌شود.\n\n"
+            "برای جلوگیری از واگذاری جایزه به فرد فاقد شرایط، "
+            "قرعه‌کشی مجدد انجام می‌شود."
+        )
+
+        conn = db_connect()
+
+        conn.execute("""
+            UPDATE winners
+            SET announced=-1
+            WHERE id=?
+        """, (
+            winner["id"],
+        ))
+
+        conn.commit()
+        conn.close()
+
+        # قرعه‌کشی مجدد با حذف برنده قبلی
+        excluded = {winner["user_id"]}
+
+        eligible_tickets = await get_eligible_tickets(
+            context.bot,
+            campaign_id,
+            excluded_users=excluded
+        )
+
+        if not eligible_tickets:
+            await update.message.reply_text(
+                "❌ فرد واجد شرایط دیگری برای قرعه‌کشی پیدا نشد."
+            )
+            return
+
+        new_winner_id = random.choice(
+            eligible_tickets
+        )
+
+        conn = db_connect()
+
+        conn.execute("""
+            INSERT INTO winners(
+                campaign_id,
+                user_id,
+                prize,
+                selected_at,
+                announced
+            )
+            VALUES(?,?,?,?,?)
+        """, (
+            campaign_id,
+            new_winner_id,
+            winner["prize"],
+            datetime.utcnow().isoformat(),
+            0
+        ))
+
+        conn.commit()
         conn.close()
 
         await update.message.reply_text(
-            "❌ برنده پیدا نشد."
+            "🔄 قرعه‌کشی مجدد انجام شد.\n\n"
+            f"👤 برنده جدید: {new_winner_id}\n\n"
+            "در صورت تأیید شرایط، دوباره /announce را اجرا کنید."
         )
 
         return
 
-    conn.execute(
-        """
+    conn = db_connect()
+
+    conn.execute("""
         UPDATE winners
         SET announced=1
         WHERE id=?
-        """,
-        (row["id"],),
-    )
+    """, (
+        winner["id"],
+    ))
 
     conn.commit()
     conn.close()
 
-    name = row["first_name"] or "کاربر"
+    user = get_user(
+        winner["user_id"]
+    )
 
-    message = f"""
-🏆 برنده محفل خوش‌شانس‌ها
+    name = (
+        user["first_name"]
+        if user and user["first_name"]
+        else "برنده"
+    )
 
-🎁 کمپین:
-{row["title"]}
-
-🏆 جایزه:
-{row["prize"]}
-
-👤 برنده:
-{name}
-
-🎉 تبریک به برنده!
-
-🤝 با حمایت اسپانسرهای محفل
-"""
+    announcement = (
+        "🏆🎉 برنده جدید محفل خوش‌شانس‌ها 🎉🏆\n\n"
+        f"🎁 مسابقه: {winner['title']}\n"
+        f"👤 برنده: {name}\n"
+        f"🏆 جایزه: {winner['prize']}\n\n"
+        "✅ شرایط عضویت تلگرام بررسی شد.\n\n"
+        "📢 برای دریافت جایزه باید شرایط اعلام‌شده "
+        "مسابقه را رعایت کرده باشید.\n\n"
+        "🎉 به برنده تبریک می‌گوییم!"
+    )
 
     await update.message.reply_text(
-        message
+        announcement
     )
 
     try:
+        await context.bot.send_message(
+            winner["user_id"],
+            announcement
+        )
+    except Exception as e:
+        logger.warning(
+            "Could not notify winner: %s",
+            e
+        )
 
+    try:
         await context.bot.send_message(
             TELEGRAM_CHANNEL,
-            message,
+            announcement
         )
-
     except Exception as e:
-
         logger.warning(
-            "Channel announce error: %s",
-            e,
+            "Could not announce in channel: %s",
+            e
         )
 
 
-# =========================================================
-# USERS
-# =========================================================
+# ============================================================
+# ADMIN RULES
+# ============================================================
 
-async def users_admin(update, context):
-
-    if not await admin_required(update):
+async def rulesadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
-    conn = db()
+    text = " ".join(context.args).strip()
 
-    rows = conn.execute(
-        """
-        SELECT *
+    if not text:
+        await update.message.reply_text(
+            "متن جدید قوانین را وارد کنید."
+        )
+        return
+
+    global RULES_TEXT
+
+    RULES_TEXT = text
+
+    await update.message.reply_text(
+        "✅ قوانین در حافظه برنامه به‌روزرسانی شد."
+    )
+
+
+# ============================================================
+# ADMIN USERS
+# ============================================================
+
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    conn = db_connect()
+
+    rows = conn.execute("""
+        SELECT id, first_name, username, chances, joined_at
         FROM users
-        ORDER BY joined_at DESC
-        LIMIT 20
-        """
-    ).fetchall()
+        ORDER BY id DESC
+        LIMIT 50
+    """).fetchall()
 
     conn.close()
 
     if not rows:
-
         await update.message.reply_text(
             "کاربری وجود ندارد."
         )
-
         return
 
-    text = "👥 آخرین کاربران\n\n"
+    lines = ["👥 آخرین کاربران\n"]
 
     for row in rows:
+        username = (
+            f"@{row['username']}"
+            if row["username"]
+            else "-"
+        )
 
-        text += (
-            f"ID: {row['id']}\n"
-            f"نام: {row['first_name'] or '-'}\n"
-            f"شانس: {row['chances']}\n"
-            f"تاریخ: {row['joined_at'][:10]}\n\n"
+        lines.append(
+            f"🆔 {row['id']} | "
+            f"{row['first_name'] or '-'} | "
+            f"{username} | "
+            f"🎟 {row['chances']}"
         )
 
     await update.message.reply_text(
-        text
+        "\n".join(lines)
     )
 
 
-# =========================================================
-# PARTICIPANTS
-# =========================================================
+# ============================================================
+# ADMIN PARTICIPANTS
+# ============================================================
 
-async def participants_admin(update, context):
-
-    if not await admin_required(update):
+async def participants(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
-
         await update.message.reply_text(
             "مثال:\n/participants 1"
         )
-
         return
 
     try:
-        campaign_id = int(
-            context.args[0]
-        )
-    except:
-
+        campaign_id = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ شناسه اشتباه."
+            "ID صحیح وارد کنید."
         )
-
         return
 
-    conn = db()
+    conn = db_connect()
 
-    total_tickets = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM participations
-        WHERE campaign_id=?
-        """,
-        (campaign_id,),
-    ).fetchone()[0]
-
-    users = conn.execute(
-        """
-        SELECT COUNT(DISTINCT user_id)
-        FROM participations
-        WHERE campaign_id=?
-        """,
-        (campaign_id,),
-    ).fetchone()[0]
+    rows = conn.execute("""
+        SELECT
+            p.user_id,
+            COUNT(*) AS chances,
+            users.first_name,
+            users.username
+        FROM participations p
+        LEFT JOIN users
+            ON users.id=p.user_id
+        WHERE p.campaign_id=?
+        GROUP BY p.user_id
+        ORDER BY chances DESC
+    """, (
+        campaign_id,
+    )).fetchall()
 
     conn.close()
 
+    if not rows:
+        await update.message.reply_text(
+            "شرکت‌کننده‌ای وجود ندارد."
+        )
+        return
+
+    lines = [
+        f"🎟 شرکت‌کنندگان مسابقه {campaign_id}\n"
+    ]
+
+    for row in rows:
+        lines.append(
+            f"👤 {row['first_name'] or '-'} "
+            f"({row['user_id']}) "
+            f"🎟 {row['chances']}"
+        )
+
     await update.message.reply_text(
-        f"""
-🎟 آمار کمپین
-
-کمپین: {campaign_id}
-
-👥 کاربران:
-{users:,}
-
-🎟 کل شانس‌ها:
-{total_tickets:,}
-        """
+        "\n".join(lines)
     )
 
 
-# =========================================================
-# SUPPORT ADMIN
-# =========================================================
+# ============================================================
+# ADMIN TICKETS
+# ============================================================
 
-async def tickets_admin(update, context):
-
-    if not await admin_required(update):
+async def tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
-    conn = db()
+    conn = db_connect()
 
-    rows = conn.execute(
-        """
+    rows = conn.execute("""
         SELECT *
         FROM support_tickets
         WHERE status='open'
         ORDER BY id DESC
-        LIMIT 20
-        """
-    ).fetchall()
+        LIMIT 30
+    """).fetchall()
 
     conn.close()
 
     if not rows:
-
         await update.message.reply_text(
-            "🎧 تیکت باز وجود ندارد."
+            "🎧 تیکت بازی وجود ندارد."
         )
-
         return
 
-    text = "🎧 تیکت‌های باز\n\n"
+    lines = ["🎧 تیکت‌های باز\n"]
 
     for row in rows:
-
-        text += (
-            f"#{row['id']}\n"
-            f"User: {row['user_id']}\n"
-            f"{row['message']}\n\n"
+        lines.append(
+            f"#{row['id']} | "
+            f"user={row['user_id']}\n"
+            f"{row['message']}\n"
         )
 
     await update.message.reply_text(
-        text
+        "\n".join(lines)
     )
 
 
-async def reply_ticket(update, context):
+# ============================================================
+# ADMIN REPLY
+# ============================================================
 
-    if not await admin_required(update):
+async def reply_ticket(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
         return
 
     if len(context.args) < 2:
-
         await update.message.reply_text(
-            "مثال:\n/reply 12 پاسخ شما"
+            "فرمت:\n/reply شماره_تیکت متن پاسخ"
         )
-
         return
 
     try:
-
-        ticket_id = int(
-            context.args[0]
-        )
-
-    except:
-
+        ticket_id = int(context.args[0])
+    except ValueError:
         await update.message.reply_text(
-            "❌ شماره تیکت اشتباه."
+            "شماره تیکت صحیح نیست."
         )
-
         return
 
-    answer = " ".join(
+    reply_text = " ".join(
         context.args[1:]
     )
 
-    conn = db()
+    conn = db_connect()
 
-    ticket = conn.execute(
-        """
+    ticket = conn.execute("""
         SELECT *
         FROM support_tickets
         WHERE id=?
-        """,
-        (ticket_id,),
-    ).fetchone()
+    """, (
+        ticket_id,
+    )).fetchone()
 
     if not ticket:
-
         conn.close()
 
         await update.message.reply_text(
             "❌ تیکت پیدا نشد."
         )
-
         return
 
-    conn.execute(
-        """
+    conn.execute("""
         UPDATE support_tickets
-        SET answer=?,
-            status='answered',
-            answered_at=?
+        SET status='closed',
+            replied_at=?,
+            reply=?
         WHERE id=?
-        """,
-        (
-            answer,
-            datetime.utcnow().isoformat(),
-            ticket_id,
-        ),
-    )
+    """, (
+        datetime.utcnow().isoformat(),
+        reply_text,
+        ticket_id
+    ))
 
     conn.commit()
     conn.close()
 
     try:
-
         await context.bot.send_message(
             ticket["user_id"],
-            f"""
-🎧 پاسخ پشتیبانی
-
-تیکت #{ticket_id}
-
-{answer}
-            """,
+            "🎧 پاسخ پشتیبانی\n\n"
+            + reply_text
         )
-
-    except:
-        pass
+    except Exception as e:
+        logger.warning(
+            "Could not send support reply: %s",
+            e
+        )
 
     await update.message.reply_text(
         "✅ پاسخ ارسال شد."
     )
 
 
-# =========================================================
-# BROADCAST
-# =========================================================
+# ============================================================
+# ADMIN BROADCAST
+# ============================================================
 
-async def broadcast(update, context):
-
-    if not await admin_required(update):
+async def broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
         return
 
-    if not context.args:
+    text = " ".join(
+        context.args
+    ).strip()
 
+    if not text:
         await update.message.reply_text(
             "مثال:\n/broadcast متن پیام"
         )
-
         return
 
-    message = " ".join(
-        context.args
-    )
+    conn = db_connect()
 
-    conn = db()
-
-    rows = conn.execute(
-        """
+    rows = conn.execute("""
         SELECT id
         FROM users
         WHERE is_active=1
-        """
-    ).fetchall()
+    """).fetchall()
 
     conn.close()
 
     sent = 0
 
     for row in rows:
-
         try:
-
             await context.bot.send_message(
                 row["id"],
-                message,
+                text
             )
 
             sent += 1
 
-            await asyncio.sleep(
-                0.05
-            )
+            await asyncio.sleep(0.05)
 
-        except:
+        except Exception:
             pass
 
     await update.message.reply_text(
-        f"📣 ارسال انجام شد.\n\nموفق: {sent:,}"
+        f"✅ پیام برای {sent:,} کاربر ارسال شد."
     )
 
 
-# =========================================================
-# LOGS
-# =========================================================
+# ============================================================
+# AUTOMATIC CHANNEL POSTS
+# ============================================================
 
-async def logs_admin(update, context):
+CHANNEL_MESSAGES = [
+    """
+🔥 محفل خوش‌شانس‌ها داره بزرگ‌تر میشه!
 
-    if not await admin_required(update):
+🎯 هدف بزرگ ما: رسیدن شبکه به ۱۰۰,۰۰۰ نفر
+
+بعد از رسیدن به حد فعال‌سازی، قرعه‌کشی‌ها باز می‌شوند. 🎁
+
+👥 دوستات رو دعوت کن
+🎟 شانس رایگان بیشتری بگیر
+📢 عضو کانال تلگرام باش
+📸 اینستاگرام محفل رو دنبال کن
+▶️ یوتیوب محفل رو دنبال کن
+
+⚠️ رعایت شرایط شبکه‌های اجتماعی برای دریافت جایزه الزامی است.
+
+🤝 اگر اسپانسر هستید و می‌خواهید در جوایز محفل حضور داشته باشید، از طریق پشتیبانی پیام بدهید.
+""",
+
+    """
+🚨 محفل خوش‌شانس‌ها منتظر توئه!
+
+هنوز اول راهیم و هر نفر مهمه. 🔥
+
+👥 دوستات رو وارد محفل کن
+🎟 شانس رایگان بگیر
+📢 کانال رو از دست نده
+📸 اینستاگرام رو دنبال کن
+▶️ یوتیوب رو دنبال کن
+
+🎯 وقتی شبکه به ۱۰۰,۰۰۰ برسد، مرحله قرعه‌کشی فعال می‌شود.
+
+🏆 برای دریافت جایزه، رعایت شرایط اعلام‌شده مسابقه الزامی است.
+
+💼 اسپانسرها برای همکاری و حمایت از جوایز با پشتیبانی در ارتباط باشند.
+""",
+
+    """
+🎁 می‌خوای وارد قرعه‌کشی‌های محفل خوش‌شانس‌ها بشی؟
+
+پس از همین الان همراه باش!
+
+1️⃣ عضو کانال تلگرام
+2️⃣ دنبال کردن اینستاگرام
+3️⃣ دنبال کردن یوتیوب
+4️⃣ دعوت دوستان
+5️⃣ جمع کردن شانس‌های رایگان
+
+🎯 هدف فعال شدن قرعه‌کشی: ۱۰۰,۰۰۰ نفر
+
+🔥 این تازه شروع محفل است.
+
+🤝 اسپانسر هستی؟
+برای همکاری با پشتیبانی پیام بده.
+""",
+
+    """
+🚀 محفل خوش‌شانس‌ها رو با دوستات بساز!
+
+هر عضو جدید یعنی یک قدم نزدیک‌تر به باز شدن مرحله قرعه‌کشی. 🎯
+
+🎟 ثبت‌نام رایگان
+👥 دعوت دوستان
+🏆 جوایز ویژه
+📢 عضویت تلگرام الزامی برای دریافت جایزه
+📸 دنبال کردن اینستاگرام الزامی
+▶️ دنبال کردن یوتیوب الزامی
+
+⚠️ شرایط دریافت جایزه باید کامل رعایت شود.
+
+🔥 عدد بعدی ما: ۱۰۰,۰۰۰
+
+💼 برای اسپانسری و همکاری با پشتیبانی در ارتباط باشید.
+"""
+]
+
+
+async def send_channel_post(app):
+    index = random.randrange(
+        len(CHANNEL_MESSAGES)
+    )
+
+    base_message = CHANNEL_MESSAGES[index]
+
+    try:
+        status = network_status_text()
+
+        message = (
+            base_message
+            + "\n\n"
+            + "━━━━━━━━━━━━━━\n"
+            + status
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🎁 ورود به محفل",
+                    url=f"https://t.me/{BOT_USERNAME}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📸 اینستاگرام",
+                    url=INSTAGRAM_URL
+                ),
+                InlineKeyboardButton(
+                    "▶️ یوتیوب",
+                    url=YOUTUBE_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🎧 پشتیبانی / اسپانسری",
+                    url=f"https://t.me/{BOT_USERNAME}"
+                )
+            ]
+        ])
+
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHANNEL,
+            text=message,
+            reply_markup=keyboard
+        )
+
+        logger.info(
+            "Automatic channel post sent."
+        )
+
+    except Exception as e:
+        logger.warning(
+            "Automatic channel post failed: %s",
+            e
+        )
+
+
+async def automatic_channel_posts(app):
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            await send_channel_post(app)
+        except Exception as e:
+            logger.warning(
+                "Channel post loop error: %s",
+                e
+            )
+
+        await asyncio.sleep(
+            CHANNEL_POST_INTERVAL_HOURS * 60 * 60
+        )
+
+
+# ============================================================
+# NETWORK UPDATE LOOP
+# ============================================================
+
+async def update_network_counts(app):
+    # YouTube automatic
+    youtube_count = get_youtube_subscribers()
+
+    if youtube_count is not None:
+        set_setting(
+            "youtube_followers",
+            youtube_count
+        )
+
+    # Telegram automatic
+    try:
+        telegram_count = await app.bot.get_chat_member_count(
+            TELEGRAM_CHANNEL
+        )
+
+        set_setting(
+            "telegram_followers",
+            telegram_count
+        )
+
+    except Exception as e:
+        logger.warning(
+            "Telegram member count error: %s",
+            e
+        )
+
+    # Instagram فعلاً دستی است
+    set_setting(
+        "network_last_update",
+        datetime.utcnow().isoformat()
+    )
+
+    set_setting(
+        "networks_activated",
+        "1" if all_networks_reached() else "0"
+    )
+
+
+async def network_loop(app):
+    await asyncio.sleep(20)
+
+    while True:
+        try:
+            await update_network_counts(app)
+        except Exception as e:
+            logger.warning(
+                "Network loop error: %s",
+                e
+            )
+
+        await asyncio.sleep(
+            NETWORK_UPDATE_HOURS * 60 * 60
+        )
+
+
+# ============================================================
+# ADMIN POST NOW
+# ============================================================
+
+async def postnow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
         return
 
-    conn = db()
+    await send_channel_post(
+        context.application
+    )
 
-    rows = conn.execute(
-        """
+    await update.message.reply_text(
+        "✅ پیام کانال ارسال شد."
+    )
+
+
+# ============================================================
+# ADMIN LOGS
+# ============================================================
+
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    conn = db_connect()
+
+    rows = conn.execute("""
         SELECT *
         FROM operation_logs
         ORDER BY id DESC
         LIMIT 30
-        """
-    ).fetchall()
+    """).fetchall()
 
     conn.close()
 
     if not rows:
-
         await update.message.reply_text(
             "لاگی وجود ندارد."
         )
-
         return
 
-    text = "📜 آخرین عملیات\n\n"
+    lines = ["📝 آخرین عملیات\n"]
 
     for row in rows:
-
-        text += (
-            f"{row['created_at']}\n"
-            f"User: {row['user_id']}\n"
-            f"{row['action']}\n\n"
+        lines.append(
+            f"#{row['id']} | "
+            f"admin={row['admin_id']} | "
+            f"{row['action']} | "
+            f"{row['details']}"
         )
 
     await update.message.reply_text(
-        text
+        "\n".join(lines)
     )
 
 
-# =========================================================
-# HELP
-# =========================================================
+# ============================================================
+# ERROR HANDLER
+# ============================================================
 
-async def help_command(update, context):
-
-    await update.message.reply_text(
-        """
-🍀 محفل خوش‌شانس‌ها
-
-ثبت‌نام و شرکت در کمپین‌ها رایگان است.
-
-از /start شروع کنید.
-
-در صورت نیاز از بخش 🎧 پشتیبانی استفاده کنید.
-        """,
-        reply_markup=main_menu(),
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    logger.exception(
+        "Unhandled exception:",
+        exc_info=context.error
     )
 
 
-# =========================================================
-# CALLBACK ROUTER
-# =========================================================
+# ============================================================
+# POST INIT
+# ============================================================
 
-async def callback_router(update, context):
+async def post_init(application):
+    init_db()
 
-    query = update.callback_query
+    logger.info(
+        "Database initialized."
+    )
 
-    data = query.data
+    logger.info(
+        "Starting background network task."
+    )
 
-    if data == "home":
-        await home(update, context)
+    asyncio.create_task(
+        network_loop(application)
+    )
 
-    elif data == "accept_rules":
-        await accept_rules(update, context)
+    logger.info(
+        "Starting automatic channel post task."
+    )
 
-    elif data == "campaigns":
-        await show_campaigns(update, context)
-
-    elif data.startswith("campaign_"):
-        await campaign_detail(update, context)
-
-    elif data.startswith("join_"):
-        await join_campaign(update, context)
-
-    elif data == "profile":
-        await show_profile(update, context)
-
-    elif data == "chances":
-        await show_chances(update, context)
-
-    elif data == "invite":
-        await show_invite(update, context)
-
-    elif data == "history":
-        await show_history(update, context)
-
-    elif data == "winners":
-        await show_winners(update, context)
-
-    elif data == "archive":
-        await show_archive(update, context)
-
-    elif data == "rules":
-        await show_rules(update, context)
-
-    elif data == "support":
-        await show_support(update, context)
-
-
-# =========================================================
-# ERROR
-# =========================================================
-
-async def error_handler(update, context):
-
-    logger.error(
-        "Unhandled error: %s",
-        context.error,
+    asyncio.create_task(
+        automatic_channel_posts(application)
     )
 
 
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
-
     if not BOT_TOKEN:
-
         raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
+            "BOT_TOKEN is not set."
         )
 
     init_db()
@@ -3221,178 +3160,18 @@ def main():
         .build()
     )
 
-    # -------------------------
+    application.post_init = post_init
+
+    # ----------------------------
     # USER
-    # -------------------------
+    # ----------------------------
 
     application.add_handler(
         CommandHandler(
             "start",
-            start,
+            start
         )
     )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    # -------------------------
-    # ADMIN
-    # -------------------------
-
-    application.add_handler(
-        CommandHandler(
-            "admin",
-            admin_panel,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "stats",
-            stats,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "network",
-            network,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "igfollowers",
-            set_instagram_followers,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "ytfollowers",
-            set_youtube_followers,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "tgfollowers",
-            set_telegram_followers,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "activation",
-            activation,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "maxfollowers",
-            maxfollowers,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "dailyprize",
-            daily_prize,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "newcampaign",
-            new_campaign,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "newsponsor",
-            new_sponsor,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "sponsorbudget",
-            sponsor_budget,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "draw",
-            draw_campaign,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "announce",
-            announce_winner,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "rulesadmin",
-            rules_admin,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "users",
-            users_admin,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "participants",
-            participants_admin,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "tickets",
-            tickets_admin,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "reply",
-            reply_ticket,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "broadcast",
-            broadcast,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "logs",
-            logs_admin,
-        )
-    )
-
-    # -------------------------
-    # CALLBACKS
-    # -------------------------
 
     application.add_handler(
         CallbackQueryHandler(
@@ -3400,15 +3179,168 @@ def main():
         )
     )
 
-    # -------------------------
-    # SUPPORT TEXT
-    # -------------------------
-
     application.add_handler(
         MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            receive_support,
+            filters.TEXT & ~filters.COMMAND,
+            text_message_handler
+        )
+    )
+
+    # ----------------------------
+    # ADMIN
+    # ----------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "admin",
+            admin
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "network",
+            network
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "igfollowers",
+            igfollowers
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ytfollowers",
+            ytfollowers
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tgfollowers",
+            tgfollowers
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "activation",
+            activation
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "maxfollowers",
+            maxfollowers
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "dailyprize",
+            dailyprize
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "newcampaign",
+            newcampaign
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "newsponsor",
+            newsponsor
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "sponsorbudget",
+            sponsorbudget
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "draw",
+            draw
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "announce",
+            announce
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "rulesadmin",
+            rulesadmin
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "users",
+            users
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "participants",
+            participants
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tickets",
+            tickets
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reply",
+            reply_ticket
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "broadcast",
+            broadcast
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "postnow",
+            postnow
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "logs",
+            logs
         )
     )
 
@@ -3416,33 +3348,19 @@ def main():
         error_handler
     )
 
-    # -------------------------
-    # NETWORK TASK
-    # -------------------------
-
-    async def post_init(app):
-
-        asyncio.create_task(
-            network_loop(app)
-        )
-
-    application.post_init = post_init
-
-    # -------------------------
-    # RENDER WEBHOOK
-    # -------------------------
+    # ========================================================
+    # RENDER
+    # ========================================================
 
     if RENDER_EXTERNAL_URL:
-
         webhook_url = (
             RENDER_EXTERNAL_URL.rstrip("/")
-            + "/"
-            + BOT_TOKEN
+            + f"/{BOT_TOKEN}"
         )
 
         logger.info(
-            "Starting webhook: %s",
-            webhook_url,
+            "Starting webhook on port %s",
+            PORT
         )
 
         application.run_webhook(
@@ -3450,13 +3368,11 @@ def main():
             port=PORT,
             url_path=BOT_TOKEN,
             webhook_url=webhook_url,
-            drop_pending_updates=True,
         )
 
     else:
-
         logger.info(
-            "Starting polling mode..."
+            "Starting polling."
         )
 
         application.run_polling(
