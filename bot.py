@@ -3201,4 +3201,268 @@ async def error_handler(update, context):
     )
 
 
-# =================================================
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    init_db()
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # -------------------------
+    # USER
+    # -------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
+
+    # -------------------------
+    # ADMIN
+    # -------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "admin",
+            admin_panel,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "network",
+            network,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "igfollowers",
+            set_instagram_followers,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ytfollowers",
+            set_youtube_followers,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tgfollowers",
+            set_telegram_followers,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "activation",
+            activation,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "maxfollowers",
+            maxfollowers,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "dailyprize",
+            daily_prize,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "newcampaign",
+            new_campaign,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "newsponsor",
+            new_sponsor,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "sponsorbudget",
+            sponsor_budget,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "draw",
+            draw_campaign,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "announce",
+            announce_winner,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "rulesadmin",
+            rules_admin,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "users",
+            users_admin,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "participants",
+            participants_admin,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tickets",
+            tickets_admin,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reply",
+            reply_ticket,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "broadcast",
+            broadcast,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "logs",
+            logs_admin,
+        )
+    )
+
+    # -------------------------
+    # CALLBACKS
+    # -------------------------
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_router
+        )
+    )
+
+    # -------------------------
+    # SUPPORT TEXT
+    # -------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            receive_support,
+        )
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    # -------------------------
+    # NETWORK TASK
+    # -------------------------
+
+    async def post_init(app):
+
+        asyncio.create_task(
+            network_loop(app)
+        )
+
+    application.post_init = post_init
+
+    # -------------------------
+    # RENDER WEBHOOK
+    # -------------------------
+
+    if RENDER_EXTERNAL_URL:
+
+        webhook_url = (
+            RENDER_EXTERNAL_URL.rstrip("/")
+            + "/"
+            + BOT_TOKEN
+        )
+
+        logger.info(
+            "Starting webhook: %s",
+            webhook_url,
+        )
+
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+
+    else:
+
+        logger.info(
+            "Starting polling mode..."
+        )
+
+        application.run_polling(
+            drop_pending_updates=True
+        )
+
+
+if __name__ == "__main__":
+    main()
