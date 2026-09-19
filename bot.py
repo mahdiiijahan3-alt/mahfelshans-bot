@@ -2,7 +2,10 @@ import os
 import sqlite3
 import logging
 import asyncio
+import json
 from datetime import datetime
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,29 +18,71 @@ from telegram.ext import (
 )
 
 # =========================================================
-# SETTINGS
+# CONFIG
 # =========================================================
+
+BOT_USERNAME = "MahfelShansBot"
+
+DB_FILE = "mahfelshans.db"
+
+INSTAGRAM_URL = "https://instagram.com/MAHFELSHANS"
+YOUTUBE_URL = "https://youtube.com/@mahfelshans"
+
+DEFAULT_YOUTUBE_HANDLE = "@mahfelshans"
+DEFAULT_TELEGRAM_CHANNEL = "@MahfelShans"
+
+NETWORK_UPDATE_HOURS = int(os.environ.get("NETWORK_UPDATE_HOURS", "6"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-BOT_USERNAME = "MahfelShansBot"
-DB_FILE = "mahfelshans.db"
-
-INSTAGRAM_URL = "https://instagram.com/MAHFELSHANS"
-YOUTUBE_URL = "https://youtube.com/@mahfelshans"
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-def get_db():
+def db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def setting_get(conn, key, default=None):
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (key,)
+    ).fetchone()
+
+    if row is None:
+        return default
+
+    return row["value"]
+
+
+def setting_set(conn, key, value):
+    conn.execute(
+        """
+        INSERT INTO settings(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+        """,
+        (key, str(value))
+    )
+    conn.commit()
+
+
+def setting_int(conn, key, default=0):
+    value = setting_get(conn, key, default)
+
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def column_exists(conn, table, column):
@@ -55,44 +100,14 @@ def add_column_if_missing(conn, table, column, definition):
         )
 
 
-def get_setting(conn, key, default=""):
-    row = conn.execute(
-        "SELECT value FROM settings WHERE key = ?",
-        (key,)
-    ).fetchone()
+def init_db():
 
-    if row:
-        return row["value"]
+    conn = db()
 
-    return default
+    # ---------------- USERS ----------------
 
-
-def set_setting(conn, key, value):
     conn.execute(
         """
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key)
-        DO UPDATE SET value = excluded.value
-        """,
-        (key, str(value))
-    )
-
-
-def get_int_setting(conn, key, default=0):
-    value = get_setting(conn, key, str(default))
-
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return default
-
-
-def init_db():
-    conn = get_db()
-
-    # USERS
-    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             first_name TEXT,
@@ -101,36 +116,43 @@ def init_db():
             invited_by INTEGER,
             created_at TEXT
         )
-    """)
+        """
+    )
 
     add_column_if_missing(
         conn,
         "users",
         "support_mode",
-        "TEXT DEFAULT 'human'"
+        "INTEGER DEFAULT 0"
     )
 
-    # REFERRALS
-    conn.execute("""
+    # ---------------- REFERRALS ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS referrals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             referrer_id INTEGER NOT NULL,
             referred_id INTEGER NOT NULL UNIQUE,
             created_at TEXT
         )
-    """)
+        """
+    )
 
-    # CAMPAIGNS
-    conn.execute("""
+    # ---------------- CAMPAIGNS ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS campaigns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
+            title TEXT,
             description TEXT,
             prize TEXT,
-            active INTEGER DEFAULT 1,
+            active INTEGER DEFAULT 0,
             created_at TEXT
         )
-    """)
+        """
+    )
 
     add_column_if_missing(
         conn,
@@ -143,14 +165,14 @@ def init_db():
         conn,
         "campaigns",
         "rules_version",
-        "TEXT DEFAULT '1'"
+        "INTEGER DEFAULT 1"
     )
 
     add_column_if_missing(
         conn,
         "campaigns",
         "draw_at",
-        "TEXT DEFAULT ''"
+        "TEXT"
     )
 
     add_column_if_missing(
@@ -167,79 +189,110 @@ def init_db():
         "INTEGER DEFAULT 0"
     )
 
-    # PARTICIPATIONS
-    conn.execute("""
+    # ---------------- PARTICIPATIONS ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS participations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            campaign_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            campaign_id INTEGER,
+            user_id INTEGER,
             chances_used INTEGER DEFAULT 1,
             created_at TEXT,
             UNIQUE(campaign_id, user_id)
         )
-    """)
+        """
+    )
 
-    # RULE ACCEPTANCES
-    conn.execute("""
+    # ---------------- RULE ACCEPTANCES ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS rule_acceptances (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            campaign_id INTEGER NOT NULL,
-            rules_version TEXT,
+            user_id INTEGER,
+            campaign_id INTEGER,
+            rules_version INTEGER,
             accepted INTEGER DEFAULT 0,
             accepted_at TEXT,
             UNIQUE(user_id, campaign_id)
         )
-    """)
+        """
+    )
 
-    # WINNERS
-    conn.execute("""
+    # ---------------- WINNERS ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS winners (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            campaign_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            campaign_id INTEGER,
+            user_id INTEGER,
             announced INTEGER DEFAULT 0,
             announced_at TEXT,
             created_at TEXT,
             UNIQUE(campaign_id)
         )
-    """)
+        """
+    )
 
-    # SUPPORT
-    conn.execute("""
+    # ---------------- SUPPORT ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS support_tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
+            user_id INTEGER,
+            message TEXT,
             status TEXT DEFAULT 'open',
             admin_reply TEXT,
             created_at TEXT,
             replied_at TEXT
         )
-    """)
+        """
+    )
 
-    # PAYMENTS - READY FOR FUTURE
-    conn.execute("""
+    # ---------------- PAYMENTS ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER,
             campaign_id INTEGER,
-            amount INTEGER DEFAULT 0,
+            amount INTEGER,
             gateway TEXT,
             transaction_code TEXT,
             status TEXT DEFAULT 'pending',
             created_at TEXT,
             paid_at TEXT
         )
-    """)
+        """
+    )
 
-    # SETTINGS
-    conn.execute("""
+    # ---------------- SETTINGS ----------------
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
-    """)
+        """
+    )
+
+    # ---------------- LOGS ----------------
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            action TEXT,
+            created_at TEXT
+        )
+        """
+    )
 
     defaults = {
         "followers": "0",
@@ -248,44 +301,54 @@ def init_db():
         "daily_prize_amount": "10000000",
         "payment_enabled": "0",
         "rules_version": "1",
-        "rules_text": (
-            "شرایط و قوانین شرکت در کمپین:\n\n"
-            "اطلاعات کامل هر کمپین در صفحه همان کمپین اعلام می‌شود.\n"
-            "شرکت‌کننده باید اطلاعات خود را صحیح وارد کند.\n"
-            "نتیجه قرعه‌کشی و شرایط دریافت جایزه طبق قوانین "
-            "اعلام‌شده همان کمپین خواهد بود."
+
+        # NEW NETWORK SETTINGS
+        "instagram_followers": os.environ.get(
+            "INSTAGRAM_FOLLOWERS",
+            "0"
         ),
+        "youtube_followers": "0",
+        "telegram_followers": "0",
+        "networks_activated": "0",
+        "network_last_update": "",
     }
 
+    default_rules = (
+        "۱. شرکت در مسابقات طبق قوانین اعلام‌شده انجام می‌شود.\n"
+        "۲. هر کاربر مسئول اطلاعات حساب خود است.\n"
+        "۳. هر معرفی موفق یک شانس اضافه ایجاد می‌کند.\n"
+        "۴. اعلام برندگان پس از قرعه‌کشی انجام خواهد شد.\n"
+        "۵. قوانین هر کمپین ممکن است شرایط اختصاصی داشته باشد."
+    )
+
     for key, value in defaults.items():
+
+        exists = conn.execute(
+            "SELECT 1 FROM settings WHERE key=?",
+            (key,)
+        ).fetchone()
+
+        if not exists:
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?)",
+                (key, str(value))
+            )
+
+    # Default rules
+    if not setting_get(conn, "rules_text"):
+        setting_set(conn, "rules_text", default_rules)
+
+    # First campaign
+    campaign_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM campaigns"
+    ).fetchone()["c"]
+
+    if campaign_count == 0:
+
         conn.execute(
             """
-            INSERT OR IGNORE INTO settings (key, value)
-            VALUES (?, ?)
-            """,
-            (key, value)
-        )
-
-    # LOGS
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS operation_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            action TEXT,
-            details TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # FIRST CAMPAIGN
-    count = conn.execute(
-        "SELECT COUNT(*) FROM campaigns"
-    ).fetchone()[0]
-
-    if count == 0:
-        conn.execute(
-            """
-            INSERT INTO campaigns (
+            INSERT INTO campaigns
+            (
                 title,
                 description,
                 prize,
@@ -293,23 +356,21 @@ def init_db():
                 created_at,
                 rules,
                 rules_version,
-                draw_at,
                 archived,
                 prize_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?,?,?,?,?,?,?,?,?)
             """,
             (
-                "اولین کمپین محفل",
-                "جزئیات کمپین به‌زودی اعلام می‌شود.",
-                "جایزه ویژه محفل",
+                "اولین کمپین محفل خوش شانس ها",
+                "کمپین به زودی فعال می‌شود.",
+                "جایزه ویژه",
                 0,
                 datetime.utcnow().isoformat(),
-                get_setting(conn, "rules_text"),
-                get_setting(conn, "rules_version"),
-                "",
+                default_rules,
+                1,
                 0,
-                0,
+                0
             )
         )
 
@@ -322,56 +383,43 @@ def init_db():
 # =========================================================
 
 def get_admin_ids():
+
     raw = os.environ.get("ADMIN_IDS", "")
 
     result = []
 
-    for item in raw.split(","):
-        item = item.strip()
+    for x in raw.split(","):
 
-        if item.isdigit():
-            result.append(int(item))
+        x = x.strip()
+
+        if not x:
+            continue
+
+        try:
+            result.append(int(x))
+        except Exception:
+            pass
 
     return result
 
 
 def is_admin(user_id):
+
     return user_id in get_admin_ids()
 
 
-async def admin_required(update):
-    user = update.effective_user
+def log_action(admin_id, action):
 
-    if not user or not is_admin(user.id):
-        if update.message:
-            await update.message.reply_text(
-                "⛔ دسترسی مدیریت ندارید."
-            )
-
-        elif update.callback_query:
-            await update.callback_query.answer(
-                "⛔ دسترسی مدیریت ندارید.",
-                show_alert=True
-            )
-
-        return False
-
-    return True
-
-
-def log_action(admin_id, action, details=""):
-    conn = get_db()
+    conn = db()
 
     conn.execute(
         """
-        INSERT INTO operation_logs
-        (admin_id, action, details, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO operation_logs(admin_id, action, created_at)
+        VALUES(?,?,?)
         """,
         (
             admin_id,
             action,
-            details,
             datetime.utcnow().isoformat()
         )
     )
@@ -380,94 +428,582 @@ def log_action(admin_id, action, details=""):
     conn.close()
 
 
+async def admin_required(update):
+
+    user = update.effective_user
+
+    if not user or not is_admin(user.id):
+
+        await update.message.reply_text(
+            "⛔ این بخش فقط برای مدیریت ربات است."
+        )
+
+        return False
+
+    return True
+
+
 # =========================================================
-# MAIN MENU
+# NETWORK API
 # =========================================================
 
-def main_keyboard():
+def fetch_youtube_subscribers_sync():
+
+    api_key = os.environ.get("YOUTUBE_API_KEY")
+
+    if not api_key:
+        logger.warning(
+            "YOUTUBE_API_KEY is not configured."
+        )
+        return None
+
+    handle = os.environ.get(
+        "YOUTUBE_HANDLE",
+        DEFAULT_YOUTUBE_HANDLE
+    )
+
+    params = urlencode({
+        "part": "statistics",
+        "forHandle": handle,
+        "key": api_key,
+    })
+
+    url = (
+        "https://www.googleapis.com/youtube/v3/channels?"
+        + params
+    )
+
+    try:
+
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "MahfelShansBot/1.0"
+            }
+        )
+
+        with urlopen(request, timeout=20) as response:
+
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        items = data.get("items", [])
+
+        if not items:
+            logger.error(
+                "YouTube channel not found: %s",
+                handle
+            )
+            return None
+
+        statistics = items[0].get(
+            "statistics",
+            {}
+        )
+
+        subscribers = statistics.get(
+            "subscriberCount"
+        )
+
+        if subscribers is None:
+            return None
+
+        return int(subscribers)
+
+    except Exception as e:
+
+        logger.exception(
+            "YouTube API error: %s",
+            e
+        )
+
+        return None
+
+
+async def fetch_youtube_subscribers():
+
+    return await asyncio.to_thread(
+        fetch_youtube_subscribers_sync
+    )
+
+
+async def fetch_telegram_members(bot):
+
+    channel = os.environ.get(
+        "TELEGRAM_CHANNEL",
+        DEFAULT_TELEGRAM_CHANNEL
+    )
+
+    try:
+
+        count = await bot.get_chat_member_count(
+            channel
+        )
+
+        return int(count)
+
+    except Exception as e:
+
+        logger.exception(
+            "Telegram member count error: %s",
+            e
+        )
+
+        return None
+
+
+def get_instagram_followers():
+
+    conn = db()
+
+    value = setting_int(
+        conn,
+        "instagram_followers",
+        0
+    )
+
+    conn.close()
+
+    return value
+
+
+# =========================================================
+# NETWORK STATUS
+# =========================================================
+
+def get_network_counts():
+
+    conn = db()
+
+    instagram = setting_int(
+        conn,
+        "instagram_followers",
+        0
+    )
+
+    youtube = setting_int(
+        conn,
+        "youtube_followers",
+        0
+    )
+
+    telegram = setting_int(
+        conn,
+        "telegram_followers",
+        0
+    )
+
+    target = setting_int(
+        conn,
+        "activation_followers",
+        100000
+    )
+
+    activated = setting_int(
+        conn,
+        "networks_activated",
+        0
+    )
+
+    last_update = setting_get(
+        conn,
+        "network_last_update",
+        ""
+    )
+
+    conn.close()
+
+    return {
+        "instagram": instagram,
+        "youtube": youtube,
+        "telegram": telegram,
+        "target": target,
+        "activated": activated,
+        "last_update": last_update,
+    }
+
+
+def network_status_text():
+
+    data = get_network_counts()
+
+    target = data["target"]
+
+    ig = data["instagram"]
+    yt = data["youtube"]
+    tg = data["telegram"]
+
+    def line(name, count):
+
+        if count <= 0:
+
+            return (
+                f"{name}: دریافت نشده ⏳\n"
+                f"هدف: {target:,}"
+            )
+
+        if count >= target:
+
+            return (
+                f"{name}: {count:,} / "
+                f"{target:,} ✅\n"
+                f"هدف تکمیل شد"
+            )
+
+        remaining = target - count
+
+        return (
+            f"{name}: {count:,} / "
+            f"{target:,}\n"
+            f"باقی‌مانده: {remaining:,}"
+        )
+
+    text = (
+        "📊 وضعیت رشد محفل خوش شانس ها\n\n"
+        f"📸 Instagram\n"
+        f"{line('Instagram', ig)}\n\n"
+        f"▶️ YouTube\n"
+        f"{line('YouTube', yt)}\n\n"
+        f"📢 Telegram\n"
+        f"{line('Telegram', tg)}\n\n"
+    )
+
+    if (
+        ig >= target
+        and yt >= target
+        and tg >= target
+    ):
+
+        text += (
+            "🎉 هر سه شبکه به ۱۰۰,۰۰۰ رسیده‌اند.\n"
+            "🔥 کمپین‌ها فعال هستند."
+        )
+
+    else:
+
+        text += (
+            "🔒 قرعه‌کشی هنوز فعال نشده است.\n"
+            "هر سه شبکه باید جداگانه به "
+            f"{target:,} نفر برسند."
+        )
+
+    if data["last_update"]:
+
+        text += (
+            "\n\n🕐 آخرین بررسی: "
+            + data["last_update"]
+        )
+
+    return text
+
+
+def all_networks_reached(conn):
+
+    target = setting_int(
+        conn,
+        "activation_followers",
+        100000
+    )
+
+    instagram = setting_int(
+        conn,
+        "instagram_followers",
+        0
+    )
+
+    youtube = setting_int(
+        conn,
+        "youtube_followers",
+        0
+    )
+
+    telegram = setting_int(
+        conn,
+        "telegram_followers",
+        0
+    )
+
+    return (
+        instagram >= target
+        and youtube >= target
+        and telegram >= target
+    )
+
+
+async def activate_all_campaigns(bot):
+
+    conn = db()
+
+    already = setting_int(
+        conn,
+        "networks_activated",
+        0
+    )
+
+    if not all_networks_reached(conn):
+
+        conn.close()
+        return False
+
+    if already == 1:
+
+        conn.close()
+        return False
+
+    conn.execute(
+        """
+        UPDATE campaigns
+        SET active=1
+        WHERE archived=0
+        """
+    )
+
+    setting_set(
+        conn,
+        "networks_activated",
+        1
+    )
+
+    conn.commit()
+    conn.close()
+
+    channel = os.environ.get(
+        "TELEGRAM_CHANNEL",
+        DEFAULT_TELEGRAM_CHANNEL
+    )
+
+    message = (
+        "🎉🎉🎉 خبر بزرگ محفل خوش شانس ها 🎉🎉🎉\n\n"
+        "📸 Instagram: 100,000 ✅\n"
+        "▶️ YouTube: 100,000 ✅\n"
+        "📢 Telegram: 100,000 ✅\n\n"
+        "🔥 هر سه شبکه به حد نصاب رسیدند.\n"
+        "🎁 کمپین‌ها و قرعه‌کشی‌های محفل خوش شانس ها فعال شدند.\n\n"
+        "✨ از اینجا به بعد وارد مرحله مسابقات می‌شویم."
+    )
+
+    try:
+
+        await bot.send_message(
+            chat_id=channel,
+            text=message,
+            disable_web_page_preview=True
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Could not send activation announcement: %s",
+            e
+        )
+
+    return True
+
+
+async def update_network_counts(bot, post_update=True):
+
+    logger.info(
+        "Updating social network counts..."
+    )
+
+    youtube_task = asyncio.create_task(
+        fetch_youtube_subscribers()
+    )
+
+    telegram_task = asyncio.create_task(
+        fetch_telegram_members(bot)
+    )
+
+    youtube = await youtube_task
+    telegram = await telegram_task
+
+    conn = db()
+
+    # Instagram currently uses stored/manual value.
+    instagram = setting_int(
+        conn,
+        "instagram_followers",
+        0
+    )
+
+    if youtube is not None:
+
+        setting_set(
+            conn,
+            "youtube_followers",
+            youtube
+        )
+
+    if telegram is not None:
+
+        setting_set(
+            conn,
+            "telegram_followers",
+            telegram
+        )
+
+    now = datetime.utcnow().strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    setting_set(
+        conn,
+        "network_last_update",
+        now
+    )
+
+    conn.commit()
+    conn.close()
+
+    logger.info(
+        "Network counts: IG=%s YT=%s TG=%s",
+        instagram,
+        youtube,
+        telegram
+    )
+
+    activated = await activate_all_campaigns(bot)
+
+    if post_update:
+
+        channel = os.environ.get(
+            "TELEGRAM_CHANNEL",
+            DEFAULT_TELEGRAM_CHANNEL
+        )
+
+        status = network_status_text()
+
+        try:
+
+            await bot.send_message(
+                chat_id=channel,
+                text=(
+                    "📈 گزارش خودکار رشد محفل خوش شانس ها\n\n"
+                    + status
+                ),
+                disable_web_page_preview=True
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Could not post network update: %s",
+                e
+            )
+
+    return activated
+
+
+async def periodic_network_update(app):
+
+    # Give Render / Telegram a little time after startup.
+    await asyncio.sleep(15)
+
+    while True:
+
+        try:
+
+            await update_network_counts(
+                app.bot,
+                post_update=True
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Periodic network update failed: %s",
+                e
+            )
+
+        await asyncio.sleep(
+            NETWORK_UPDATE_HOURS * 60 * 60
+        )
+
+
+# =========================================================
+# START / REFERRAL
+# =========================================================
+
+def main_menu():
+
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🎁 کمپین‌ها و جوایز",
+                "🎁 کمپین‌ها",
                 callback_data="campaigns"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👤 پروفایل من",
-                callback_data="profile"
             ),
             InlineKeyboardButton(
-                "🎟 شانس‌های من",
-                callback_data="chances"
+                "👤 پروفایل",
+                callback_data="profile"
             )
         ],
         [
             InlineKeyboardButton(
-                "👥 دعوت از دوستان",
+                "🍀 شانس‌های من",
+                callback_data="chances"
+            ),
+            InlineKeyboardButton(
+                "👥 دعوت دوستان",
                 callback_data="invite"
             )
         ],
         [
             InlineKeyboardButton(
-                "📋 سوابق شرکت",
+                "📜 تاریخچه",
                 callback_data="history"
-            )
-        ],
-        [
+            ),
             InlineKeyboardButton(
                 "🏆 برندگان",
                 callback_data="winners"
-            ),
-            InlineKeyboardButton(
-                "🗃 آرشیو",
-                callback_data="archive"
             )
         ],
         [
             InlineKeyboardButton(
-                "📜 قوانین",
-                callback_data="rules"
+                "🗄 آرشیو",
+                callback_data="archive"
             ),
             InlineKeyboardButton(
-                "💬 پشتیبانی",
+                "📋 قوانین",
+                callback_data="rules"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎧 پشتیبانی",
                 callback_data="support"
             )
         ],
         [
             InlineKeyboardButton(
-                "📸 اینستاگرام",
+                "📸 Instagram",
                 url=INSTAGRAM_URL
             ),
             InlineKeyboardButton(
-                "▶️ یوتیوب",
+                "▶️ YouTube",
                 url=YOUTUBE_URL
             )
         ]
     ])
 
 
-# =========================================================
-# START
-# =========================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     user = update.effective_user
 
     if not user:
         return
 
-    conn = get_db()
+    conn = db()
 
     existing = conn.execute(
-        "SELECT id FROM users WHERE id = ?",
+        "SELECT id FROM users WHERE id=?",
         (user.id,)
     ).fetchone()
 
-    # حفظ کامل منطق قبلی دعوت
     if not existing:
 
-        referrer_id = None
+        invited_by = None
 
         if context.args:
 
@@ -475,25 +1011,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if arg.startswith("ref_"):
 
-                possible_referrer = arg[4:]
+                try:
 
-                if possible_referrer.isdigit():
+                    referrer_id = int(
+                        arg.replace("ref_", "", 1)
+                    )
 
-                    possible_referrer = int(possible_referrer)
+                    if referrer_id != user.id:
 
-                    if possible_referrer != user.id:
-
-                        referrer_exists = conn.execute(
-                            "SELECT id FROM users WHERE id = ?",
-                            (possible_referrer,)
+                        referrer = conn.execute(
+                            "SELECT id FROM users WHERE id=?",
+                            (referrer_id,)
                         ).fetchone()
 
-                        if referrer_exists:
-                            referrer_id = possible_referrer
+                        if referrer:
+
+                            invited_by = referrer_id
+
+                except Exception:
+                    pass
 
         conn.execute(
             """
-            INSERT INTO users (
+            INSERT INTO users
+            (
                 id,
                 first_name,
                 username,
@@ -501,33 +1042,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 invited_by,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES(?,?,?,?,?,?)
             """,
             (
                 user.id,
                 user.first_name or "",
                 user.username or "",
                 0,
-                referrer_id,
+                invited_by,
                 datetime.utcnow().isoformat()
             )
         )
 
-        if referrer_id:
+        if invited_by:
 
             try:
 
                 conn.execute(
                     """
-                    INSERT INTO referrals (
+                    INSERT INTO referrals
+                    (
                         referrer_id,
                         referred_id,
                         created_at
                     )
-                    VALUES (?, ?, ?)
+                    VALUES(?,?,?)
                     """,
                     (
-                        referrer_id,
+                        invited_by,
                         user.id,
                         datetime.utcnow().isoformat()
                     )
@@ -536,10 +1078,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.execute(
                     """
                     UPDATE users
-                    SET chances = chances + 1
-                    WHERE id = ?
+                    SET chances=chances+1
+                    WHERE id=?
                     """,
-                    (referrer_id,)
+                    (invited_by,)
                 )
 
             except sqlite3.IntegrityError:
@@ -550,9 +1092,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute(
             """
             UPDATE users
-            SET first_name = ?,
-                username = ?
-            WHERE id = ?
+            SET first_name=?,
+                username=?
+            WHERE id=?
             """,
             (
                 user.first_name or "",
@@ -561,62 +1103,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-    followers = get_int_setting(
-        conn,
-        "followers",
-        0
-    )
-
-    activation = get_int_setting(
-        conn,
-        "activation_followers",
-        100000
-    )
-
     conn.commit()
     conn.close()
 
-    if followers >= activation:
-        status_text = "🎉 قرعه‌کشی‌ها فعال شدند!"
-    else:
-        status_text = "🔒 قرعه‌کشی‌ها هنوز فعال نشده‌اند."
+    status = network_status_text()
 
     text = (
-        f"🎉 سلام {user.first_name or 'دوست عزیز'}!\n\n"
-        "به «محفل خوش‌شانس‌ها» خوش اومدی ❤️\n\n"
-        f"{status_text}\n\n"
-        "🎁 کمپین‌ها و جوایز\n"
-        "👥 دعوت از دوستان\n"
-        "🎟 مدیریت شانس‌ها\n"
-        "📋 سوابق شرکت\n"
-        "🏆 برندگان\n\n"
-        "👇 از منوی زیر شروع کن:"
+        "🎉 به «محفل خوش شانس ها» خوش آمدی!\n\n"
+        "اینجا قراره با رشد جامعه محفل، "
+        "کمپین‌ها و جوایز مختلف برگزار بشه.\n\n"
+        "🔥 شرط شروع قرعه‌کشی:\n"
+        "هر سه شبکه باید جداگانه به ۱۰۰,۰۰۰ نفر برسند.\n\n"
+        + status
+        + "\n\n"
+        "👇 از منوی زیر انتخاب کن:"
     )
 
-    if update.message:
-        await update.message.reply_text(
-            text,
-            reply_markup=main_keyboard()
-        )
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ راهنمای محفل\n\n"
-        "🎁 کمپین‌ها و جوایز\n"
-        "👤 پروفایل من\n"
-        "🎟 شانس‌های من\n"
-        "👥 دعوت از دوستان\n"
-        "📋 سوابق شرکت\n"
-        "🏆 برندگان\n"
-        "🗃 آرشیو\n"
-        "📜 قوانین\n"
-        "💬 پشتیبانی\n\n"
-        "برای شروع /start را بزنید."
+        text,
+        reply_markup=main_menu()
     )
 
 
@@ -624,46 +1129,52 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PROFILE
 # =========================================================
 
-async def show_profile(query):
-    user_id = query.from_user.id
+async def show_profile(update, context):
 
-    conn = get_db()
+    user = update.effective_user
+
+    conn = db()
 
     row = conn.execute(
-        "SELECT * FROM users WHERE id = ?",
-        (user_id,)
+        """
+        SELECT *
+        FROM users
+        WHERE id=?
+        """,
+        (user.id,)
     ).fetchone()
 
-    referral_count = conn.execute(
+    referrals = conn.execute(
         """
-        SELECT COUNT(*)
+        SELECT COUNT(*) AS c
         FROM referrals
-        WHERE referrer_id = ?
+        WHERE referrer_id=?
         """,
-        (user_id,)
-    ).fetchone()[0]
+        (user.id,)
+    ).fetchone()["c"]
 
     conn.close()
 
     if not row:
-        await query.message.reply_text(
-            "ابتدا /start را بزنید."
+
+        await update.callback_query.message.reply_text(
+            "ابتدا /start را بزن."
         )
+
         return
 
-    username = (
-        f"@{row['username']}"
-        if row["username"]
-        else "ندارد"
+    text = (
+        "👤 پروفایل شما\n\n"
+        f"نام: {row['first_name'] or '-'}\n"
+        f"شناسه: {row['id']}\n"
+        f"نام کاربری: @{row['username'] if row['username'] else '-'}\n\n"
+        f"🍀 شانس‌ها: {row['chances']}\n"
+        f"👥 معرفی موفق: {referrals}"
     )
 
-    await query.message.reply_text(
-        f"👤 پروفایل من\n\n"
-        f"نام: {row['first_name']}\n"
-        f"نام کاربری: {username}\n"
-        f"شناسه کاربری: {row['id']}\n\n"
-        f"👥 معرفی موفق: {referral_count} نفر\n"
-        f"🎟 شانس‌های من: {row['chances']}"
+    await update.callback_query.message.reply_text(
+        text,
+        reply_markup=main_menu()
     )
 
 
@@ -671,29 +1182,25 @@ async def show_profile(query):
 # CHANCES
 # =========================================================
 
-async def show_chances(query):
-    user_id = query.from_user.id
+async def show_chances(update, context):
 
-    conn = get_db()
+    user = update.effective_user
+
+    conn = db()
 
     row = conn.execute(
-        """
-        SELECT chances
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,)
+        "SELECT chances FROM users WHERE id=?",
+        (user.id,)
     ).fetchone()
 
     conn.close()
 
     chances = row["chances"] if row else 0
 
-    await query.message.reply_text(
-        f"🎟 شانس‌های من\n\n"
-        f"تعداد شانس‌های شما: {chances}\n\n"
-        "👥 با معرفی دوستان می‌توانید شانس‌های بیشتری "
-        "به دست بیاورید."
+    await update.callback_query.message.reply_text(
+        f"🍀 شانس‌های شما: {chances}\n\n"
+        "هر معرفی موفق یک شانس اضافه ایجاد می‌کند.",
+        reply_markup=main_menu()
     )
 
 
@@ -701,33 +1208,47 @@ async def show_chances(query):
 # INVITE
 # =========================================================
 
-async def show_invite(query):
-    user_id = query.from_user.id
+async def show_invite(update, context):
 
-    invite_link = (
-        f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
-    )
+    user = update.effective_user
 
-    conn = get_db()
+    conn = db()
 
-    count = conn.execute(
+    row = conn.execute(
+        "SELECT chances FROM users WHERE id=?",
+        (user.id,)
+    ).fetchone()
+
+    referrals = conn.execute(
         """
-        SELECT COUNT(*)
+        SELECT COUNT(*) AS c
         FROM referrals
-        WHERE referrer_id = ?
+        WHERE referrer_id=?
         """,
-        (user_id,)
-    ).fetchone()[0]
+        (user.id,)
+    ).fetchone()["c"]
 
     conn.close()
 
-    await query.message.reply_text(
-        f"👥 دعوت از دوستان\n\n"
-        f"تعداد معرفی موفق شما: {count}\n\n"
-        f"🔗 لینک اختصاصی شما:\n"
-        f"{invite_link}\n\n"
-        "لینک را برای دوستانت ارسال کن.\n"
-        "با ورود موفق دوست جدید، یک شانس برای شما ثبت می‌شود. 🎟"
+    chances = row["chances"] if row else 0
+
+    link = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start=ref_{user.id}"
+    )
+
+    text = (
+        "👥 دعوت دوستان\n\n"
+        "دوستت را با لینک اختصاصی خودت دعوت کن.\n"
+        "هر معرفی موفق = ۱ شانس 🍀\n\n"
+        f"🔗 لینک شما:\n{link}\n\n"
+        f"👥 معرفی موفق: {referrals}\n"
+        f"🍀 شانس فعلی: {chances}"
+    )
+
+    await update.callback_query.message.reply_text(
+        text,
+        reply_markup=main_menu()
     )
 
 
@@ -735,247 +1256,139 @@ async def show_invite(query):
 # CAMPAIGNS
 # =========================================================
 
-async def show_campaigns(query):
-    conn = get_db()
+def lottery_is_active():
 
-    followers = get_int_setting(
-        conn,
-        "followers",
-        0
-    )
+    conn = db()
 
-    activation = get_int_setting(
-        conn,
-        "activation_followers",
-        100000
-    )
+    active = all_networks_reached(conn)
 
-    max_followers = get_int_setting(
-        conn,
-        "plan_max_followers",
-        500000
-    )
+    conn.close()
 
-    daily_prize = get_int_setting(
-        conn,
-        "daily_prize_amount",
-        10000000
-    )
+    return active
+
+
+async def show_campaigns(update, context):
+
+    query = update.callback_query
+
+    conn = db()
 
     campaigns = conn.execute(
         """
         SELECT *
         FROM campaigns
-        WHERE active = 1
-        AND archived = 0
+        WHERE archived=0
         ORDER BY id DESC
         """
     ).fetchall()
 
     conn.close()
 
-    if followers < activation:
+    if not all_networks_reached(db()):
+
+        text = (
+            "🔒 کمپین‌ها هنوز فعال نشده‌اند.\n\n"
+            + network_status_text()
+        )
 
         await query.message.reply_text(
-            "🔒 قرعه‌کشی‌ها هنوز فعال نشده‌اند.\n\n"
-            f"👥 فالوور ثبت‌شده: {followers:,}\n"
-            f"🎯 حد فعال‌شدن: {activation:,}\n\n"
-            "به‌محض رسیدن به حد تعیین‌شده، "
-            "کمپین‌ها طبق تنظیمات مدیریت فعال می‌شوند."
+            text,
+            reply_markup=main_menu()
         )
 
         return
-
-    text = (
-        "🎉 قرعه‌کشی‌ها فعال شدند!\n\n"
-        f"📈 برنامه فعلی:\n"
-        f"از {activation:,} تا {max_followers:,} فالوور\n"
-        f"🎁 جایزه روزانه: {daily_prize:,} تومان\n\n"
-    )
 
     if not campaigns:
 
         await query.message.reply_text(
-            text + "🎁 در حال حاضر کمپین فعالی وجود ندارد."
+            "فعلاً کمپینی وجود ندارد.",
+            reply_markup=main_menu()
         )
 
         return
 
-    keyboard = []
+    buttons = []
 
     for campaign in campaigns:
 
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🏆 {campaign['title']}",
-                callback_data=f"campaign_{campaign['id']}"
-            )
-        ])
+        if campaign["active"]:
+
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🎁 {campaign['title']}",
+                    callback_data=f"campaign_{campaign['id']}"
+                )
+            ])
+
+    if not buttons:
+
+        await query.message.reply_text(
+            "در حال حاضر کمپین فعالی وجود ندارد.",
+            reply_markup=main_menu()
+        )
+
+        return
 
     await query.message.reply_text(
-        text + "👇 کمپین موردنظر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "🎁 کمپین‌های فعال:",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
-# =========================================================
-# CAMPAIGN DETAILS
-# =========================================================
+async def show_campaign_details(update, context, campaign_id):
 
-async def show_campaign_details(query, campaign_id):
-    conn = get_db()
+    query = update.callback_query
+
+    conn = db()
 
     campaign = conn.execute(
         """
         SELECT *
         FROM campaigns
-        WHERE id = ?
-        AND active = 1
-        AND archived = 0
+        WHERE id=?
         """,
         (campaign_id,)
     ).fetchone()
 
-    followers = get_int_setting(
-        conn,
-        "followers",
-        0
-    )
-
-    activation = get_int_setting(
-        conn,
-        "activation_followers",
-        100000
-    )
-
-    acceptance = conn.execute(
-        """
-        SELECT accepted
-        FROM rule_acceptances
-        WHERE user_id = ?
-        AND campaign_id = ?
-        """,
-        (
-            query.from_user.id,
-            campaign_id
-        )
-    ).fetchone()
-
-    participation = conn.execute(
-        """
-        SELECT id
-        FROM participations
-        WHERE campaign_id = ?
-        AND user_id = ?
-        """,
-        (
-            campaign_id,
-            query.from_user.id
-        )
-    ).fetchone()
-
     conn.close()
 
-    if followers < activation:
+    if not campaign:
+
         await query.message.reply_text(
-            "🔒 قرعه‌کشی‌ها هنوز فعال نشده‌اند."
+            "کمپین پیدا نشد."
         )
+
         return
 
-    if not campaign:
+    if not lottery_is_active():
+
         await query.message.reply_text(
-            "❌ این کمپین پیدا نشد."
+            "🔒 این کمپین هنوز فعال نشده است.\n\n"
+            + network_status_text()
         )
+
         return
 
     text = (
-        f"🏆 {campaign['title']}\n\n"
-        f"🎁 جایزه:\n{campaign['prize']}\n\n"
-        f"📝 توضیحات:\n{campaign['description'] or '---'}\n\n"
+        f"🎁 {campaign['title']}\n\n"
+        f"📝 {campaign['description'] or '-'}\n\n"
+        f"🏆 جایزه: {campaign['prize'] or '-'}\n\n"
     )
 
     if campaign["draw_at"]:
-        text += f"🕐 زمان قرعه‌کشی: {campaign['draw_at']}\n\n"
 
-    keyboard = []
-
-    if participation:
-        text += "✅ شما در این کمپین ثبت‌نام کرده‌اید.\n"
-    elif acceptance and acceptance["accepted"]:
-
-        keyboard.append([
-            InlineKeyboardButton(
-                "🎟 شرکت در کمپین",
-                callback_data=f"join_{campaign_id}"
-            )
-        ])
-
-    else:
-
-        keyboard.append([
-            InlineKeyboardButton(
-                "📜 مشاهده و پذیرش قوانین",
-                callback_data=f"rules_campaign_{campaign_id}"
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔙 کمپین‌ها",
-            callback_data="campaigns"
+        text += (
+            f"🕐 زمان قرعه‌کشی: "
+            f"{campaign['draw_at']}\n\n"
         )
-    ])
 
-    await query.message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# =========================================================
-# CAMPAIGN RULES
-# =========================================================
-
-async def show_campaign_rules(query, campaign_id):
-    conn = get_db()
-
-    campaign = conn.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id = ?
-        """,
-        (campaign_id,)
-    ).fetchone()
-
-    conn.close()
-
-    if not campaign:
-        await query.message.reply_text(
-            "❌ کمپین پیدا نشد."
-        )
-        return
-
-    rules = campaign["rules"] or "قوانین این کمپین هنوز ثبت نشده است."
-
-    text = (
-        f"📜 قوانین کمپین\n\n"
-        f"🏆 {campaign['title']}\n\n"
-        f"{rules}\n\n"
-        "«قوانین و شرایط شرکت در کمپین را مطالعه کردم و می‌پذیرم.»"
-    )
+    text += "برای شرکت روی دکمه زیر بزن."
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ می‌پذیرم و ادامه می‌دهم",
-                callback_data=f"accept_{campaign_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔙 بازگشت",
-                callback_data=f"campaign_{campaign_id}"
+                "📋 مشاهده قوانین",
+                callback_data=f"rules_{campaign_id}"
             )
         ]
     ])
@@ -986,56 +1399,106 @@ async def show_campaign_rules(query, campaign_id):
     )
 
 
-# =========================================================
-# ACCEPT RULES
-# =========================================================
+async def show_campaign_rules(update, context, campaign_id):
 
-async def accept_rules(query, campaign_id):
-    user_id = query.from_user.id
+    query = update.callback_query
 
-    conn = get_db()
+    conn = db()
 
     campaign = conn.execute(
         """
         SELECT *
         FROM campaigns
-        WHERE id = ?
-        AND active = 1
-        AND archived = 0
+        WHERE id=?
+        """,
+        (campaign_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not campaign:
+
+        await query.message.reply_text(
+            "کمپین پیدا نشد."
+        )
+
+        return
+
+    rules = (
+        campaign["rules"]
+        or "قوانین عمومی محفل خوش شانس ها."
+    )
+
+    text = (
+        f"📋 قوانین کمپین\n\n"
+        f"{rules}\n\n"
+        "در صورت قبول قوانین، روی دکمه زیر بزن."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ قبول قوانین",
+                callback_data=f"accept_{campaign_id}"
+            )
+        ]
+    ])
+
+    await query.message.reply_text(
+        text,
+        reply_markup=keyboard
+    )
+
+
+async def accept_rules(update, context, campaign_id):
+
+    user = update.effective_user
+
+    conn = db()
+
+    campaign = conn.execute(
+        """
+        SELECT *
+        FROM campaigns
+        WHERE id=?
         """,
         (campaign_id,)
     ).fetchone()
 
     if not campaign:
+
         conn.close()
 
-        await query.message.reply_text(
-            "❌ کمپین فعال نیست."
+        await update.callback_query.message.reply_text(
+            "کمپین پیدا نشد."
         )
+
         return
 
-    version = campaign["rules_version"] or "1"
+    version = campaign["rules_version"] or 1
 
     conn.execute(
         """
-        INSERT INTO rule_acceptances (
+        INSERT INTO rule_acceptances
+        (
             user_id,
             campaign_id,
             rules_version,
             accepted,
             accepted_at
         )
-        VALUES (?, ?, ?, 1, ?)
-        ON CONFLICT(user_id, campaign_id)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(user_id,campaign_id)
         DO UPDATE SET
-            rules_version = excluded.rules_version,
-            accepted = 1,
-            accepted_at = excluded.accepted_at
+            rules_version=excluded.rules_version,
+            accepted=excluded.accepted,
+            accepted_at=excluded.accepted_at
         """,
         (
-            user_id,
+            user.id,
             campaign_id,
             version,
+            1,
             datetime.utcnow().isoformat()
         )
     )
@@ -1043,89 +1506,91 @@ async def accept_rules(query, campaign_id):
     conn.commit()
     conn.close()
 
-    await query.message.reply_text(
-        "✅ پذیرش قوانین ثبت شد.\n\n"
-        "حالا می‌توانید در کمپین شرکت کنید.",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🎟 شرکت در کمپین",
-                    callback_data=f"join_{campaign_id}"
-                )
-            ]
-        ])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🎟 شرکت در کمپین",
+                callback_data=f"join_{campaign_id}"
+            )
+        ]
+    ])
+
+    await update.callback_query.message.reply_text(
+        "✅ قوانین با موفقیت پذیرفته شد.",
+        reply_markup=keyboard
     )
 
 
-# =========================================================
-# JOIN CAMPAIGN
-# =========================================================
+async def join_campaign(update, context, campaign_id):
 
-async def join_campaign(query, campaign_id):
-    user_id = query.from_user.id
+    user = update.effective_user
 
-    conn = get_db()
+    conn = db()
+
+    if not all_networks_reached(conn):
+
+        conn.close()
+
+        await update.callback_query.message.reply_text(
+            "🔒 کمپین هنوز فعال نشده است.\n\n"
+            + network_status_text()
+        )
+
+        return
 
     campaign = conn.execute(
         """
         SELECT *
         FROM campaigns
-        WHERE id = ?
-        AND active = 1
-        AND archived = 0
+        WHERE id=?
         """,
         (campaign_id,)
     ).fetchone()
 
-    if not campaign:
+    if not campaign or not campaign["active"]:
+
         conn.close()
 
-        await query.message.reply_text(
-            "❌ این کمپین فعال نیست."
+        await update.callback_query.message.reply_text(
+            "این کمپین فعال نیست."
         )
+
         return
 
     accepted = conn.execute(
         """
-        SELECT accepted
+        SELECT *
         FROM rule_acceptances
-        WHERE user_id = ?
-        AND campaign_id = ?
+        WHERE user_id=?
+        AND campaign_id=?
+        AND accepted=1
         """,
         (
-            user_id,
+            user.id,
             campaign_id
         )
     ).fetchone()
 
-    if not accepted or not accepted["accepted"]:
+    if not accepted:
 
         conn.close()
 
-        await query.message.reply_text(
-            "ابتدا باید قوانین کمپین را بپذیرید.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📜 مشاهده قوانین",
-                        callback_data=f"rules_campaign_{campaign_id}"
-                    )
-                ]
-            ])
+        await update.callback_query.message.reply_text(
+            "ابتدا قوانین کمپین را قبول کن."
         )
 
         return
 
     already = conn.execute(
         """
-        SELECT id
+        SELECT *
         FROM participations
-        WHERE campaign_id = ?
-        AND user_id = ?
+        WHERE campaign_id=?
+        AND user_id=?
         """,
         (
             campaign_id,
-            user_id
+            user.id
         )
     ).fetchone()
 
@@ -1133,25 +1598,27 @@ async def join_campaign(query, campaign_id):
 
         conn.close()
 
-        await query.message.reply_text(
-            "✅ شما قبلاً در این کمپین ثبت‌نام کرده‌اید."
+        await update.callback_query.message.reply_text(
+            "✅ شما قبلاً در این کمپین ثبت شده‌ای."
         )
 
         return
 
     conn.execute(
         """
-        INSERT INTO participations (
+        INSERT INTO participations
+        (
             campaign_id,
             user_id,
             chances_used,
             created_at
         )
-        VALUES (?, ?, 1, ?)
+        VALUES(?,?,?,?)
         """,
         (
             campaign_id,
-            user_id,
+            user.id,
+            1,
             datetime.utcnow().isoformat()
         )
     )
@@ -1159,10 +1626,10 @@ async def join_campaign(query, campaign_id):
     conn.commit()
     conn.close()
 
-    await query.message.reply_text(
-        "🎉 ثبت‌نام شما با موفقیت انجام شد!\n\n"
-        f"🏆 کمپین: {campaign['title']}\n"
-        "🎟 وضعیت: شرکت‌کننده ثبت شد."
+    await update.callback_query.message.reply_text(
+        "🎉 ثبت‌نام شما با موفقیت انجام شد.\n\n"
+        "🍀 شما در قرعه‌کشی این کمپین ثبت شدید.",
+        reply_markup=main_menu()
     )
 
 
@@ -1170,10 +1637,11 @@ async def join_campaign(query, campaign_id):
 # HISTORY
 # =========================================================
 
-async def show_history(query):
-    user_id = query.from_user.id
+async def show_history(update, context):
 
-    conn = get_db()
+    user = update.effective_user
+
+    conn = db()
 
     rows = conn.execute(
         """
@@ -1182,59 +1650,64 @@ async def show_history(query):
             c.title,
             c.prize
         FROM participations p
-        JOIN campaigns c
-        ON c.id = p.campaign_id
-        WHERE p.user_id = ?
+        LEFT JOIN campaigns c
+            ON c.id=p.campaign_id
+        WHERE p.user_id=?
         ORDER BY p.id DESC
+        LIMIT 20
         """,
-        (user_id,)
+        (user.id,)
     ).fetchall()
 
     conn.close()
 
     if not rows:
 
-        await query.message.reply_text(
-            "📋 هنوز سابقه‌ای برای شرکت شما ثبت نشده است."
-        )
+        text = "📜 هنوز در هیچ کمپینی شرکت نکرده‌ای."
 
-        return
+    else:
 
-    text = "📋 سوابق شرکت من\n\n"
+        text = "📜 تاریخچه شرکت شما:\n\n"
 
-    for row in rows:
+        for row in rows:
 
-        text += (
-            f"🏆 {row['title']}\n"
-            f"🎁 {row['prize']}\n"
-            f"📅 {row['created_at']}\n\n"
-        )
+            text += (
+                f"🎁 {row['title'] or '-'}\n"
+                f"🏆 {row['prize'] or '-'}\n"
+                f"🕐 {row['created_at']}\n\n"
+            )
 
-    await query.message.reply_text(text)
+    await update.callback_query.message.reply_text(
+        text,
+        reply_markup=main_menu()
+    )
 
 
 # =========================================================
 # WINNERS
 # =========================================================
 
-async def show_winners(query):
-    conn = get_db()
+async def show_winners(update, context):
+
+    conn = db()
 
     rows = conn.execute(
         """
         SELECT
-            w.*,
-            c.title,
+            w.created_at,
+            w.announced,
             u.first_name,
-            u.username
+            u.username,
+            c.title,
+            c.prize
         FROM winners w
-        JOIN campaigns c
-        ON c.id = w.campaign_id
-        JOIN users u
-        ON u.id = w.user_id
-        WHERE w.announced = 1
+        LEFT JOIN users u
+            ON u.id=w.user_id
+        LEFT JOIN campaigns c
+            ON c.id=w.campaign_id
+        WHERE w.announced=1
         ORDER BY w.id DESC
-        LIMIT 50
+        LIMIT 30
         """
     ).fetchall()
 
@@ -1242,44 +1715,43 @@ async def show_winners(query):
 
     if not rows:
 
-        await query.message.reply_text(
-            "🏆 هنوز برنده‌ای اعلام نشده است."
-        )
+        text = "🏆 هنوز برنده‌ای اعلام نشده است."
 
-        return
+    else:
 
-    text = "🏆 برندگان محفل\n\n"
+        text = "🏆 برندگان محفل خوش شانس ها\n\n"
 
-    for row in rows:
+        for row in rows:
 
-        username = (
-            f"@{row['username']}"
-            if row["username"]
-            else ""
-        )
+            name = row["first_name"] or "کاربر"
 
-        text += (
-            f"🏆 {row['title']}\n"
-            f"👤 {row['first_name']} {username}\n"
-            f"📅 {row['announced_at'] or ''}\n\n"
-        )
+            text += (
+                f"🥇 {name}\n"
+                f"🎁 {row['title'] or '-'}\n"
+                f"🏆 {row['prize'] or '-'}\n\n"
+            )
 
-    await query.message.reply_text(text)
+    await update.callback_query.message.reply_text(
+        text,
+        reply_markup=main_menu()
+    )
 
 
 # =========================================================
 # ARCHIVE
 # =========================================================
 
-async def show_archive(query):
-    conn = get_db()
+async def show_archive(update, context):
+
+    conn = db()
 
     rows = conn.execute(
         """
         SELECT *
         FROM campaigns
-        WHERE archived = 1
+        WHERE archived=1
         ORDER BY id DESC
+        LIMIT 30
         """
     ).fetchall()
 
@@ -1287,50 +1759,52 @@ async def show_archive(query):
 
     if not rows:
 
-        await query.message.reply_text(
-            "🗃 آرشیو هنوز خالی است."
-        )
+        text = "🗄 آرشیو فعلاً خالی است."
 
-        return
+    else:
 
-    text = "🗃 آرشیو کمپین‌ها\n\n"
+        text = "🗄 آرشیو کمپین‌ها\n\n"
 
-    for row in rows:
+        for row in rows:
 
-        text += (
-            f"🏆 {row['title']}\n"
-            f"🎁 {row['prize']}\n"
-            f"🕐 {row['draw_at'] or '---'}\n\n"
-        )
+            text += (
+                f"🎁 {row['title']}\n"
+                f"🏆 {row['prize'] or '-'}\n\n"
+            )
 
-    await query.message.reply_text(text)
-
-
-# =========================================================
-# GENERAL RULES
-# =========================================================
-
-async def show_rules(query):
-    conn = get_db()
-
-    rules = get_setting(
-        conn,
-        "rules_text",
-        "قوانین هنوز ثبت نشده است."
+    await update.callback_query.message.reply_text(
+        text,
+        reply_markup=main_menu()
     )
 
-    version = get_setting(
+
+# =========================================================
+# RULES
+# =========================================================
+
+async def show_rules(update, context):
+
+    conn = db()
+
+    rules = setting_get(
+        conn,
+        "rules_text",
+        "قوانین هنوز تنظیم نشده است."
+    )
+
+    version = setting_int(
         conn,
         "rules_version",
-        "1"
+        1
     )
 
     conn.close()
 
-    await query.message.reply_text(
-        f"📜 قوانین محفل\n\n"
-        f"نسخه قوانین: {version}\n\n"
-        f"{rules}"
+    await update.callback_query.message.reply_text(
+        "📋 قوانین محفل خوش شانس ها\n\n"
+        + rules
+        + f"\n\nنسخه قوانین: {version}",
+        reply_markup=main_menu()
     )
 
 
@@ -1338,21 +1812,19 @@ async def show_rules(query):
 # SUPPORT
 # =========================================================
 
-async def show_support(query):
-    await query.message.reply_text(
-        "💬 پشتیبانی محفل\n\n"
-        "پیام یا سوالت را همینجا ارسال کن.\n"
-        "پیام برای پشتیبانی ثبت می‌شود و مدیریت بررسی می‌کند."
+async def show_support(update, context):
+
+    await update.callback_query.message.reply_text(
+        "🎧 پشتیبانی\n\n"
+        "پیام خودت را همینجا ارسال کن.\n"
+        "پیام برای مدیریت ارسال می‌شود و پاسخ از طریق ربات برایت می‌آید.",
+        reply_markup=main_menu()
     )
 
 
-async def receive_support_message(update, context):
+async def handle_support_message(update, context):
+
     if not update.message:
-        return
-
-    text = update.message.text
-
-    if not text or text.startswith("/"):
         return
 
     user = update.effective_user
@@ -1360,39 +1832,48 @@ async def receive_support_message(update, context):
     if not user:
         return
 
-    conn = get_db()
+    if is_admin(user.id):
+        return
+
+    message = update.message.text
+
+    if not message:
+        return
+
+    conn = db()
 
     conn.execute(
         """
-        INSERT INTO support_tickets (
+        INSERT INTO support_tickets
+        (
             user_id,
             message,
             status,
             created_at
         )
-        VALUES (?, ?, 'open', ?)
+        VALUES(?,?,?,?)
         """,
         (
             user.id,
-            text,
+            message,
+            "open",
             datetime.utcnow().isoformat()
         )
     )
 
-    ticket_id = conn.execute(
-        "SELECT last_insert_rowid()"
-    ).fetchone()[0]
-
     conn.commit()
+
+    ticket = conn.execute(
+        "SELECT last_insert_rowid() AS id"
+    ).fetchone()["id"]
+
     conn.close()
 
     await update.message.reply_text(
-        "✅ پیام شما ثبت شد.\n\n"
-        f"🎫 شماره درخواست: {ticket_id}\n"
-        "پشتیبانی آن را بررسی می‌کند."
+        "✅ پیام شما برای پشتیبانی ارسال شد.\n"
+        f"شماره تیکت: #{ticket}"
     )
 
-    # اطلاع به ادمین‌ها
     for admin_id in get_admin_ids():
 
         try:
@@ -1400,224 +1881,414 @@ async def receive_support_message(update, context):
             await context.bot.send_message(
                 chat_id=admin_id,
                 text=(
-                    "🔔 درخواست پشتیبانی جدید\n\n"
-                    f"🎫 شماره: {ticket_id}\n"
-                    f"👤 کاربر: {user.first_name}\n"
-                    f"🆔 ID: {user.id}\n\n"
-                    f"💬 پیام:\n{text}\n\n"
-                    f"برای پاسخ:\n"
+                    "🎧 تیکت جدید پشتیبانی\n\n"
+                    f"Ticket: #{ticket}\n"
+                    f"User ID: {user.id}\n"
+                    f"Name: {user.first_name or '-'}\n\n"
+                    f"پیام:\n{message}\n\n"
+                    f"پاسخ:\n"
                     f"/reply {user.id} متن پاسخ"
                 )
             )
 
         except Exception as e:
 
-            logging.warning(
-                f"Cannot notify admin {admin_id}: {e}"
+            logger.error(
+                "Could not notify admin: %s",
+                e
             )
 
 
 # =========================================================
-# ADMIN MENU
+# ADMIN PANEL
 # =========================================================
 
-async def admin_command(update, context):
+async def admin_panel(update, context):
+
     if not await admin_required(update):
         return
 
-    await update.message.reply_text(
-        "🔐 پنل مدیریت محفل\n\n"
-        "/stats - آمار کلی\n"
-        "/followers 100000 - تعداد فالوور\n"
-        "/activation 100000 - حد فعال‌سازی\n"
-        "/maxfollowers 500000 - سقف برنامه\n"
-        "/dailyprize 10000000 - جایزه روزانه\n\n"
-        "/newcampaign عنوان | توضیحات | جایزه\n"
-        "/campaignsadmin - مدیریت کمپین‌ها\n"
-        "/activate ID - فعال کردن کمپین\n"
-        "/deactivate ID - غیرفعال کردن کمپین\n"
+    text = (
+        "🛠 پنل مدیریت محفل خوش شانس ها\n\n"
+
+        "📊 آمار:\n"
+        "/stats\n"
+        "/networkstatus\n\n"
+
+        "🌐 شبکه‌ها:\n"
+        "/igfollowers 100000\n"
+        "/followers 100000\n"
+        "/activation 100000\n"
+        "/maxfollowers 500000\n\n"
+
+        "🎁 کمپین:\n"
+        "/newcampaign عنوان | توضیح | جایزه\n"
+        "/campaignsadmin\n"
+        "/activate ID\n"
+        "/deactivate ID\n"
         "/drawdate ID تاریخ ساعت\n"
-        "/rulesadmin متن قوانین\n\n"
-        "/users - کاربران\n"
-        "/referrals - دعوت‌ها\n"
-        "/chancesadmin - شانس‌ها\n"
-        "/participants ID - شرکت‌کنندگان\n"
+        "/archive ID\n"
+        "/participants ID\n"
         "/winner CAMPAIGN_ID USER_ID\n"
-        "/announce ID - اعلام برنده\n"
-        "/archive ID - آرشیو کمپین\n\n"
-        "/tickets - درخواست‌های پشتیبانی\n"
-        "/reply USER_ID متن\n"
-        "/broadcast متن - ارسال همگانی\n"
-        "/logs - گزارش عملیات"
+        "/announce ID\n\n"
+
+        "📋 قوانین:\n"
+        "/rulesadmin متن قوانین\n\n"
+
+        "👥 کاربران:\n"
+        "/users\n"
+        "/referrals\n"
+        "/chancesadmin\n\n"
+
+        "📢 ارسال پیام:\n"
+        "/broadcast متن\n\n"
+
+        "🎧 پشتیبانی:\n"
+        "/tickets\n"
+        "/reply USER_ID متن\n\n"
+
+        "📜 لاگ:\n"
+        "/logs"
     )
+
+    await update.message.reply_text(text)
 
 
 # =========================================================
 # STATS
 # =========================================================
 
-async def stats_command(update, context):
+async def stats(update, context):
+
     if not await admin_required(update):
         return
 
-    conn = get_db()
+    conn = db()
 
     users = conn.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS c FROM users"
+    ).fetchone()["c"]
 
     referrals = conn.execute(
-        "SELECT COUNT(*) FROM referrals"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS c FROM referrals"
+    ).fetchone()["c"]
 
-    participants = conn.execute(
-        "SELECT COUNT(*) FROM participations"
-    ).fetchone()[0]
+    participations = conn.execute(
+        "SELECT COUNT(*) AS c FROM participations"
+    ).fetchone()["c"]
 
     campaigns = conn.execute(
         """
-        SELECT COUNT(*)
+        SELECT COUNT(*) AS c
         FROM campaigns
-        WHERE active = 1
-        AND archived = 0
+        WHERE active=1
+        AND archived=0
         """
-    ).fetchone()[0]
+    ).fetchone()["c"]
 
-    followers = get_int_setting(
+    conn.close()
+
+    data = get_network_counts()
+
+    status = (
+        "فعال ✅"
+        if data["activated"]
+        else "فعال نشده 🔒"
+    )
+
+    text = (
+        "📊 آمار ربات\n\n"
+        f"👥 کاربران: {users:,}\n"
+        f"🔗 معرفی‌های موفق: {referrals:,}\n"
+        f"🎟 مشارکت‌ها: {participations:,}\n"
+        f"🎁 کمپین‌های فعال: {campaigns:,}\n\n"
+
+        "🌐 شبکه‌ها:\n"
+        f"📸 Instagram: {data['instagram']:,}\n"
+        f"▶️ YouTube: {data['youtube']:,}\n"
+        f"📢 Telegram: {data['telegram']:,}\n\n"
+
+        f"🎯 حد فعال‌سازی هر شبکه: "
+        f"{data['target']:,}\n"
+        f"🔥 وضعیت: {status}"
+    )
+
+    await update.message.reply_text(text)
+
+
+# =========================================================
+# NETWORK STATUS COMMAND
+# =========================================================
+
+async def network_status_command(update, context):
+
+    if not await admin_required(update):
+        return
+
+    await update.message.reply_text(
+        "⏳ در حال دریافت آمار YouTube و Telegram..."
+    )
+
+    await update_network_counts(
+        context.bot,
+        post_update=False
+    )
+
+    await update.message.reply_text(
+        network_status_text()
+    )
+
+
+# =========================================================
+# MANUAL INSTAGRAM
+# =========================================================
+
+async def set_instagram_followers(update, context):
+
+    if not await admin_required(update):
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "مثال:\n"
+            "/igfollowers 87420"
+        )
+
+        return
+
+    try:
+
+        count = int(
+            context.args[0].replace(",", "")
+        )
+
+        if count < 0:
+            raise ValueError
+
+    except Exception:
+
+        await update.message.reply_text(
+            "❌ عدد صحیح وارد کن."
+        )
+
+        return
+
+    conn = db()
+
+    setting_set(
+        conn,
+        "instagram_followers",
+        count
+    )
+
+    # If admin lowers the number, allow activation
+    # state to be recalculated later.
+    if not all_networks_reached(conn):
+
+        setting_set(
+            conn,
+            "networks_activated",
+            0
+        )
+
+    conn.commit()
+    conn.close()
+
+    log_action(
+        update.effective_user.id,
+        f"instagram_followers={count}"
+    )
+
+    await update.message.reply_text(
+        f"✅ Instagram روی {count:,} تنظیم شد.\n\n"
+        + network_status_text()
+    )
+
+
+# =========================================================
+# OLD FOLLOWERS COMMAND
+# =========================================================
+
+async def set_followers(update, context):
+
+    if not await admin_required(update):
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "مثال:\n/followers 100000\n\n"
+            "این دستور فقط برای تست مقدار قدیمی است.\n"
+            "فعال‌سازی واقعی بر اساس هر سه شبکه انجام می‌شود."
+        )
+
+        return
+
+    try:
+
+        count = int(
+            context.args[0].replace(",", "")
+        )
+
+    except Exception:
+
+        await update.message.reply_text(
+            "❌ عدد صحیح وارد کن."
+        )
+
+        return
+
+    conn = db()
+
+    setting_set(
         conn,
         "followers",
+        count
+    )
+
+    conn.close()
+
+    log_action(
+        update.effective_user.id,
+        f"legacy_followers={count}"
+    )
+
+    await update.message.reply_text(
+        f"✅ مقدار قدیمی followers روی {count:,} قرار گرفت.\n\n"
+        "⚠️ این مقدار دیگر شرط فعال‌سازی سه‌شبکه‌ای نیست."
+    )
+
+
+# =========================================================
+# ACTIVATION TARGET
+# =========================================================
+
+async def set_activation(update, context):
+
+    if not await admin_required(update):
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "مثال:\n/activation 100000"
+        )
+
+        return
+
+    try:
+
+        count = int(
+            context.args[0].replace(",", "")
+        )
+
+        if count <= 0:
+            raise ValueError
+
+    except Exception:
+
+        await update.message.reply_text(
+            "❌ عدد صحیح مثبت وارد کن."
+        )
+
+        return
+
+    conn = db()
+
+    setting_set(
+        conn,
+        "activation_followers",
+        count
+    )
+
+    setting_set(
+        conn,
+        "networks_activated",
         0
     )
 
     conn.close()
 
-    await update.message.reply_text(
-        "📊 آمار محفل\n\n"
-        f"👤 کاربران: {users:,}\n"
-        f"👥 معرفی موفق: {referrals:,}\n"
-        f"🎟 شرکت‌ها: {participants:,}\n"
-        f"🎁 کمپین‌های فعال: {campaigns:,}\n"
-        f"📈 فالوورها: {followers:,}"
-    )
-
-
-# =========================================================
-# FOLLOWERS
-# =========================================================
-
-async def followers_command(update, context):
-    if not await admin_required(update):
-        return
-
-    if not context.args or not context.args[0].isdigit():
-
-        await update.message.reply_text(
-            "فرمت:\n/followers 100000"
-        )
-        return
-
-    value = int(context.args[0])
-
-    conn = get_db()
-    set_setting(conn, "followers", value)
-    conn.commit()
-    conn.close()
-
     log_action(
         update.effective_user.id,
-        "followers",
-        str(value)
+        f"activation_followers={count}"
     )
 
     await update.message.reply_text(
-        f"✅ تعداد فالوورها روی {value:,} تنظیم شد."
+        f"🎯 حد فعال‌سازی هر شبکه: {count:,}"
     )
 
 
-# =========================================================
-# ACTIVATION
-# =========================================================
+async def set_max_followers(update, context):
 
-async def activation_command(update, context):
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
-
+    if not context.args:
         await update.message.reply_text(
-            "فرمت:\n/activation 100000"
+            "مثال:\n/maxfollowers 500000"
         )
         return
 
-    value = int(context.args[0])
+    try:
+        value = int(
+            context.args[0].replace(",", "")
+        )
+    except Exception:
+        await update.message.reply_text(
+            "❌ عدد صحیح وارد کن."
+        )
+        return
 
-    conn = get_db()
-    set_setting(conn, "activation_followers", value)
-    conn.commit()
+    conn = db()
+
+    setting_set(
+        conn,
+        "plan_max_followers",
+        value
+    )
+
     conn.close()
 
-    log_action(
-        update.effective_user.id,
-        "activation",
-        str(value)
-    )
-
     await update.message.reply_text(
-        f"✅ حد فعال‌سازی روی {value:,} تنظیم شد."
+        f"✅ حداکثر مقدار روی {value:,} تنظیم شد."
     )
 
 
-# =========================================================
-# MAX FOLLOWERS
-# =========================================================
+async def set_daily_prize(update, context):
 
-async def maxfollowers_command(update, context):
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
-
+    if not context.args:
         await update.message.reply_text(
-            "فرمت:\n/maxfollowers 500000"
+            "مثال:\n/dailyprize 10000000"
         )
         return
 
-    value = int(context.args[0])
+    try:
+        value = int(
+            context.args[0].replace(",", "")
+        )
+    except Exception:
+        await update.message.reply_text(
+            "❌ عدد صحیح وارد کن."
+        )
+        return
 
-    conn = get_db()
-    set_setting(conn, "plan_max_followers", value)
-    conn.commit()
-    conn.close()
+    conn = db()
 
-    await update.message.reply_text(
-        f"✅ سقف برنامه روی {value:,} تنظیم شد."
+    setting_set(
+        conn,
+        "daily_prize_amount",
+        value
     )
 
-
-# =========================================================
-# DAILY PRIZE
-# =========================================================
-
-async def dailyprize_command(update, context):
-    if not await admin_required(update):
-        return
-
-    if not context.args or not context.args[0].isdigit():
-
-        await update.message.reply_text(
-            "فرمت:\n/dailyprize 10000000"
-        )
-        return
-
-    value = int(context.args[0])
-
-    conn = get_db()
-    set_setting(conn, "daily_prize_amount", value)
-    conn.commit()
     conn.close()
 
     await update.message.reply_text(
-        f"✅ جایزه روزانه روی {value:,} تومان تنظیم شد."
+        f"✅ مبلغ جایزه روزانه: {value:,}"
     )
 
 
@@ -1625,43 +2296,51 @@ async def dailyprize_command(update, context):
 # NEW CAMPAIGN
 # =========================================================
 
-async def newcampaign_command(update, context):
+async def new_campaign(update, context):
+
     if not await admin_required(update):
         return
 
-    raw = " ".join(context.args)
+    raw = update.message.text[
+        len("/newcampaign"):
+    ].strip()
 
-    parts = [x.strip() for x in raw.split("|")]
+    parts = [
+        x.strip()
+        for x in raw.split("|")
+    ]
 
     if len(parts) < 3:
 
         await update.message.reply_text(
-            "فرمت درست:\n\n"
-            "/newcampaign عنوان | توضیحات | جایزه"
+            "فرمت:\n"
+            "/newcampaign عنوان | توضیح | جایزه"
         )
+
         return
 
     title = parts[0]
     description = parts[1]
     prize = parts[2]
 
-    conn = get_db()
+    conn = db()
 
-    rules = get_setting(
+    rules = setting_get(
         conn,
         "rules_text",
         ""
     )
 
-    version = get_setting(
+    version = setting_int(
         conn,
         "rules_version",
-        "1"
+        1
     )
 
-    conn.execute(
+    cursor = conn.execute(
         """
-        INSERT INTO campaigns (
+        INSERT INTO campaigns
+        (
             title,
             description,
             prize,
@@ -1669,47 +2348,50 @@ async def newcampaign_command(update, context):
             created_at,
             rules,
             rules_version,
-            draw_at,
             archived,
             prize_amount
         )
-        VALUES (?, ?, ?, 0, ?, ?, ?, '', 0, 0)
+        VALUES(?,?,?,?,?,?,?,?,?)
         """,
         (
             title,
             description,
             prize,
+            0,
             datetime.utcnow().isoformat(),
             rules,
-            version
+            version,
+            0,
+            0
         )
     )
 
-    campaign_id = conn.execute(
-        "SELECT last_insert_rowid()"
-    ).fetchone()[0]
+    campaign_id = cursor.lastrowid
 
     conn.commit()
     conn.close()
 
+    log_action(
+        update.effective_user.id,
+        f"new_campaign={campaign_id}"
+    )
+
     await update.message.reply_text(
-        f"✅ کمپین ساخته شد.\n\n"
-        f"ID: {campaign_id}\n"
-        f"🏆 {title}\n\n"
-        "برای فعال‌سازی:\n"
-        f"/activate {campaign_id}"
+        f"✅ کمپین ساخته شد.\n"
+        f"ID: {campaign_id}"
     )
 
 
 # =========================================================
-# CAMPAIGNS ADMIN
+# ADMIN CAMPAIGNS
 # =========================================================
 
-async def campaignsadmin_command(update, context):
+async def campaigns_admin(update, context):
+
     if not await admin_required(update):
         return
 
-    conn = get_db()
+    conn = db()
 
     rows = conn.execute(
         """
@@ -1724,53 +2406,73 @@ async def campaignsadmin_command(update, context):
     if not rows:
 
         await update.message.reply_text(
-            "هیچ کمپینی وجود ندارد."
+            "کمپینی وجود ندارد."
         )
+
         return
 
-    text = "🎁 مدیریت کمپین‌ها\n\n"
+    text = "🎁 کمپین‌ها:\n\n"
 
     for row in rows:
 
-        status = "فعال" if row["active"] else "غیرفعال"
-        archived = "آرشیو" if row["archived"] else ""
+        status = (
+            "فعال ✅"
+            if row["active"]
+            else "غیرفعال 🔒"
+        )
+
+        archived = (
+            " | آرشیو"
+            if row["archived"]
+            else ""
+        )
 
         text += (
             f"ID: {row['id']}\n"
-            f"🏆 {row['title']}\n"
-            f"وضعیت: {status} {archived}\n"
-            f"🎁 {row['prize']}\n"
-            f"🕐 {row['draw_at'] or '---'}\n\n"
+            f"عنوان: {row['title']}\n"
+            f"وضعیت: {status}{archived}\n"
+            f"جایزه: {row['prize'] or '-'}\n\n"
         )
 
     await update.message.reply_text(text)
 
 
-# =========================================================
-# ACTIVATE
-# =========================================================
+async def activate_campaign(update, context):
 
-async def activate_command(update, context):
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
-
+    if not context.args:
         await update.message.reply_text(
-            "فرمت:\n/activate 1"
+            "مثال:\n/activate 1"
         )
         return
 
-    campaign_id = int(context.args[0])
+    try:
+        campaign_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text(
+            "❌ ID نامعتبر."
+        )
+        return
 
-    conn = get_db()
+    if not lottery_is_active():
+
+        await update.message.reply_text(
+            "🔒 هنوز هر سه شبکه به حد نصاب نرسیده‌اند.\n\n"
+            + network_status_text()
+        )
+
+        return
+
+    conn = db()
 
     conn.execute(
         """
         UPDATE campaigns
-        SET active = 1,
-            archived = 0
-        WHERE id = ?
+        SET active=1,
+            archived=0
+        WHERE id=?
         """,
         (campaign_id,)
     )
@@ -1779,34 +2481,36 @@ async def activate_command(update, context):
     conn.close()
 
     await update.message.reply_text(
-        f"✅ کمپین {campaign_id} فعال شد."
+        "✅ کمپین فعال شد."
     )
 
 
-# =========================================================
-# DEACTIVATE
-# =========================================================
+async def deactivate_campaign(update, context):
 
-async def deactivate_command(update, context):
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
-
+    if not context.args:
         await update.message.reply_text(
-            "فرمت:\n/deactivate 1"
+            "مثال:\n/deactivate 1"
         )
         return
 
-    campaign_id = int(context.args[0])
+    try:
+        campaign_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text(
+            "❌ ID نامعتبر."
+        )
+        return
 
-    conn = get_db()
+    conn = db()
 
     conn.execute(
         """
         UPDATE campaigns
-        SET active = 0
-        WHERE id = ?
+        SET active=0
+        WHERE id=?
         """,
         (campaign_id,)
     )
@@ -1815,15 +2519,12 @@ async def deactivate_command(update, context):
     conn.close()
 
     await update.message.reply_text(
-        f"⛔ کمپین {campaign_id} غیرفعال شد."
+        "✅ کمپین غیرفعال شد."
     )
 
 
-# =========================================================
-# DRAW DATE
-# =========================================================
+async def set_draw_date(update, context):
 
-async def drawdate_command(update, context):
     if not await admin_required(update):
         return
 
@@ -1831,32 +2532,41 @@ async def drawdate_command(update, context):
 
         await update.message.reply_text(
             "فرمت:\n"
-            "/drawdate 1 2026-10-01 20:00"
+            "/drawdate ID 2026-10-01 20:00"
         )
+
         return
 
-    campaign_id = context.args[0]
+    try:
 
-    if not campaign_id.isdigit():
+        campaign_id = int(
+            context.args[0]
+        )
+
+        date = context.args[1]
+        time = context.args[2]
+
+        draw_at = f"{date} {time}"
+
+    except Exception:
 
         await update.message.reply_text(
-            "ID کمپین باید عدد باشد."
+            "❌ فرمت اشتباه."
         )
+
         return
 
-    draw_at = f"{context.args[1]} {context.args[2]}"
-
-    conn = get_db()
+    conn = db()
 
     conn.execute(
         """
         UPDATE campaigns
-        SET draw_at = ?
-        WHERE id = ?
+        SET draw_at=?
+        WHERE id=?
         """,
         (
             draw_at,
-            int(campaign_id)
+            campaign_id
         )
     )
 
@@ -1869,45 +2579,53 @@ async def drawdate_command(update, context):
 
 
 # =========================================================
-# RULES ADMIN
+# RULE ADMIN
 # =========================================================
 
-async def rulesadmin_command(update, context):
+async def rules_admin(update, context):
+
     if not await admin_required(update):
         return
 
-    text = " ".join(context.args).strip()
+    text = update.message.text[
+        len("/rulesadmin"):
+    ].strip()
 
     if not text:
 
         await update.message.reply_text(
-            "فرمت:\n"
-            "/rulesadmin متن قوانین"
+            "فرمت:\n/rulesadmin متن قوانین"
         )
+
         return
 
-    conn = get_db()
+    conn = db()
 
-    old_version = get_setting(
-        conn,
-        "rules_version",
-        "1"
+    version = (
+        setting_int(
+            conn,
+            "rules_version",
+            1
+        ) + 1
     )
 
-    try:
-        version = str(int(old_version) + 1)
-    except (ValueError, TypeError):
-        version = "2"
+    setting_set(
+        conn,
+        "rules_text",
+        text
+    )
 
-    set_setting(conn, "rules_text", text)
-    set_setting(conn, "rules_version", version)
+    setting_set(
+        conn,
+        "rules_version",
+        version
+    )
 
     conn.execute(
         """
         UPDATE campaigns
-        SET rules = ?,
-            rules_version = ?
-        WHERE active = 0
+        SET rules=?,
+            rules_version=?
         """,
         (
             text,
@@ -1919,8 +2637,8 @@ async def rulesadmin_command(update, context):
     conn.close()
 
     await update.message.reply_text(
-        f"✅ قوانین ثبت شد.\n"
-        f"نسخه جدید: {version}"
+        f"✅ قوانین بروزرسانی شد.\n"
+        f"نسخه: {version}"
     )
 
 
@@ -1928,65 +2646,19 @@ async def rulesadmin_command(update, context):
 # USERS
 # =========================================================
 
-async def users_command(update, context):
+async def users_admin(update, context):
+
     if not await admin_required(update):
         return
 
-    conn = get_db()
+    conn = db()
 
     rows = conn.execute(
         """
-        SELECT id, first_name, username, chances, created_at
+        SELECT *
         FROM users
         ORDER BY id DESC
-        LIMIT 50
-        """
-    ).fetchall()
-
-    total = conn.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
-
-    conn.close()
-
-    text = f"👤 کاربران\nکل کاربران: {total:,}\n\n"
-
-    for row in rows:
-
-        username = (
-            f"@{row['username']}"
-            if row["username"]
-            else ""
-        )
-
-        text += (
-            f"ID: {row['id']}\n"
-            f"👤 {row['first_name']} {username}\n"
-            f"🎟 {row['chances']}\n\n"
-        )
-
-    await update.message.reply_text(text[:4000])
-
-
-# =========================================================
-# REFERRALS ADMIN
-# =========================================================
-
-async def referrals_command(update, context):
-    if not await admin_required(update):
-        return
-
-    conn = get_db()
-
-    rows = conn.execute(
-        """
-        SELECT
-            referrer_id,
-            COUNT(*) AS total
-        FROM referrals
-        GROUP BY referrer_id
-        ORDER BY total DESC
-        LIMIT 50
+        LIMIT 100
         """
     ).fetchall()
 
@@ -1995,51 +2667,97 @@ async def referrals_command(update, context):
     if not rows:
 
         await update.message.reply_text(
-            "👥 هنوز معرفی‌ای ثبت نشده است."
+            "کاربری وجود ندارد."
         )
+
         return
 
-    text = "👥 آمار دعوت‌ها\n\n"
+    text = "👥 آخرین کاربران:\n\n"
 
     for row in rows:
 
         text += (
-            f"👤 User ID: {row['referrer_id']}\n"
-            f"👥 معرفی موفق: {row['total']}\n\n"
+            f"ID: {row['id']}\n"
+            f"Name: {row['first_name'] or '-'}\n"
+            f"Username: @{row['username'] or '-'}\n"
+            f"Chances: {row['chances']}\n\n"
         )
 
     await update.message.reply_text(text)
 
 
-# =========================================================
-# CHANCES ADMIN
-# =========================================================
+async def referrals_admin(update, context):
 
-async def chancesadmin_command(update, context):
     if not await admin_required(update):
         return
 
-    conn = get_db()
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            r.referrer_id,
+            r.referred_id,
+            r.created_at,
+            u.first_name
+        FROM referrals r
+        LEFT JOIN users u
+            ON u.id=r.referrer_id
+        ORDER BY r.id DESC
+        LIMIT 100
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            "هنوز معرفی موفقی ثبت نشده."
+        )
+
+        return
+
+    text = "🔗 معرفی‌ها:\n\n"
+
+    for row in rows:
+
+        text += (
+            f"Referrer: {row['referrer_id']} "
+            f"({row['first_name'] or '-'})\n"
+            f"Referred: {row['referred_id']}\n"
+            f"{row['created_at']}\n\n"
+        )
+
+    await update.message.reply_text(text)
+
+
+async def chances_admin(update, context):
+
+    if not await admin_required(update):
+        return
+
+    conn = db()
 
     rows = conn.execute(
         """
         SELECT id, first_name, username, chances
         FROM users
         ORDER BY chances DESC
-        LIMIT 50
+        LIMIT 100
         """
     ).fetchall()
 
     conn.close()
 
-    text = "🎟 بیشترین شانس‌ها\n\n"
+    text = "🍀 بیشترین شانس‌ها:\n\n"
 
     for row in rows:
 
         text += (
-            f"ID: {row['id']}\n"
-            f"👤 {row['first_name']}\n"
-            f"🎟 {row['chances']}\n\n"
+            f"{row['id']} | "
+            f"{row['first_name'] or '-'} | "
+            f"{row['chances']} شانس\n"
         )
 
     await update.message.reply_text(text)
@@ -2049,20 +2767,28 @@ async def chancesadmin_command(update, context):
 # PARTICIPANTS
 # =========================================================
 
-async def participants_command(update, context):
+async def participants_admin(update, context):
+
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
+    if not context.args:
 
         await update.message.reply_text(
-            "فرمت:\n/participants 1"
+            "مثال:\n/participants 1"
+        )
+
+        return
+
+    try:
+        campaign_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text(
+            "❌ ID نامعتبر."
         )
         return
 
-    campaign_id = int(context.args[0])
-
-    conn = get_db()
+    conn = db()
 
     rows = conn.execute(
         """
@@ -2072,37 +2798,45 @@ async def participants_command(update, context):
             u.first_name,
             u.username
         FROM participations p
-        JOIN users u
-        ON u.id = p.user_id
-        WHERE p.campaign_id = ?
-        ORDER BY p.id DESC
+        LEFT JOIN users u
+            ON u.id=p.user_id
+        WHERE p.campaign_id=?
+        ORDER BY p.id ASC
         """,
         (campaign_id,)
     ).fetchall()
 
     conn.close()
 
-    text = (
-        f"👥 شرکت‌کنندگان کمپین {campaign_id}\n\n"
-        f"تعداد: {len(rows)}\n\n"
-    )
+    if not rows:
 
-    for row in rows[:100]:
-
-        text += (
-            f"🆔 {row['user_id']}\n"
-            f"👤 {row['first_name']}\n"
-            f"@{row['username'] if row['username'] else '---'}\n\n"
+        await update.message.reply_text(
+            "هنوز کسی شرکت نکرده."
         )
 
-    await update.message.reply_text(text[:4000])
+        return
+
+    text = (
+        f"🎟 شرکت‌کنندگان کمپین {campaign_id}\n\n"
+    )
+
+    for row in rows:
+
+        text += (
+            f"ID: {row['user_id']}\n"
+            f"نام: {row['first_name'] or '-'}\n"
+            f"Username: @{row['username'] or '-'}\n\n"
+        )
+
+    await update.message.reply_text(text)
 
 
 # =========================================================
-# REGISTER WINNER
+# WINNER ADMIN
 # =========================================================
 
-async def winner_command(update, context):
+async def set_winner(update, context):
+
     if not await admin_required(update):
         return
 
@@ -2111,116 +2845,115 @@ async def winner_command(update, context):
         await update.message.reply_text(
             "فرمت:\n/winner CAMPAIGN_ID USER_ID"
         )
-        return
 
-    if not context.args[0].isdigit() or not context.args[1].isdigit():
-
-        await update.message.reply_text(
-            "هر دو ID باید عدد باشند."
-        )
-        return
-
-    campaign_id = int(context.args[0])
-    user_id = int(context.args[1])
-
-    conn = get_db()
-
-    participant = conn.execute(
-        """
-        SELECT id
-        FROM participations
-        WHERE campaign_id = ?
-        AND user_id = ?
-        """,
-        (
-            campaign_id,
-            user_id
-        )
-    ).fetchone()
-
-    if not participant:
-
-        conn.close()
-
-        await update.message.reply_text(
-            "❌ این کاربر شرکت‌کننده این کمپین نیست."
-        )
         return
 
     try:
 
-        conn.execute(
-            """
-            INSERT INTO winners (
-                campaign_id,
-                user_id,
-                announced,
-                created_at
-            )
-            VALUES (?, ?, 0, ?)
-            """,
-            (
-                campaign_id,
-                user_id,
-                datetime.utcnow().isoformat()
-            )
+        campaign_id = int(
+            context.args[0]
         )
 
-        conn.commit()
+        user_id = int(
+            context.args[1]
+        )
 
-    except sqlite3.IntegrityError:
+    except Exception:
+
+        await update.message.reply_text(
+            "❌ ID نامعتبر."
+        )
+
+        return
+
+    conn = db()
+
+    user = conn.execute(
+        "SELECT id FROM users WHERE id=?",
+        (user_id,)
+    ).fetchone()
+
+    campaign = conn.execute(
+        "SELECT id FROM campaigns WHERE id=?",
+        (campaign_id,)
+    ).fetchone()
+
+    if not user or not campaign:
 
         conn.close()
 
         await update.message.reply_text(
-            "❌ برای این کمپین قبلاً برنده ثبت شده است."
+            "❌ کاربر یا کمپین پیدا نشد."
         )
+
         return
 
+    conn.execute(
+        """
+        INSERT INTO winners
+        (
+            campaign_id,
+            user_id,
+            announced,
+            created_at
+        )
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(campaign_id)
+        DO UPDATE SET user_id=excluded.user_id
+        """,
+        (
+            campaign_id,
+            user_id,
+            0,
+            datetime.utcnow().isoformat()
+        )
+    )
+
+    conn.commit()
     conn.close()
 
     await update.message.reply_text(
-        "✅ برنده ثبت شد.\n\n"
-        f"کمپین: {campaign_id}\n"
-        f"کاربر: {user_id}\n\n"
-        "برای اعلام عمومی:\n"
-        f"/announce {campaign_id}"
+        "🏆 برنده ثبت شد."
     )
 
 
-# =========================================================
-# ANNOUNCE WINNER
-# =========================================================
+async def announce_winner(update, context):
 
-async def announce_command(update, context):
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
+    if not context.args:
 
         await update.message.reply_text(
-            "فرمت:\n/announce 1"
+            "مثال:\n/announce 1"
+        )
+
+        return
+
+    try:
+        campaign_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text(
+            "❌ ID نامعتبر."
         )
         return
 
-    campaign_id = int(context.args[0])
-
-    conn = get_db()
+    conn = db()
 
     row = conn.execute(
         """
         SELECT
-            w.*,
-            c.title,
-            c.prize,
+            w.user_id,
             u.first_name,
-            u.username
+            u.username,
+            c.title,
+            c.prize
         FROM winners w
-        JOIN campaigns c
-        ON c.id = w.campaign_id
-        JOIN users u
-        ON u.id = w.user_id
-        WHERE w.campaign_id = ?
+        LEFT JOIN users u
+            ON u.id=w.user_id
+        LEFT JOIN campaigns c
+            ON c.id=w.campaign_id
+        WHERE w.campaign_id=?
         """,
         (campaign_id,)
     ).fetchone()
@@ -2230,66 +2963,60 @@ async def announce_command(update, context):
         conn.close()
 
         await update.message.reply_text(
-            "❌ برنده‌ای برای این کمپین ثبت نشده است."
+            "برای این کمپین برنده‌ای ثبت نشده."
         )
-        return
 
-    announced_at = datetime.utcnow().isoformat()
+        return
 
     conn.execute(
         """
         UPDATE winners
-        SET announced = 1,
-            announced_at = ?
-        WHERE campaign_id = ?
+        SET announced=1,
+            announced_at=?
+        WHERE campaign_id=?
         """,
         (
-            announced_at,
+            datetime.utcnow().isoformat(),
             campaign_id
         )
     )
 
     conn.commit()
-
-    users = conn.execute(
-        "SELECT id FROM users"
-    ).fetchall()
-
     conn.close()
 
-    username = (
-        f"@{row['username']}"
-        if row["username"]
-        else ""
+    channel = os.environ.get(
+        "TELEGRAM_CHANNEL",
+        DEFAULT_TELEGRAM_CHANNEL
     )
 
-    announcement = (
-        "🏆 برنده جدید محفل خوش‌شانس‌ها 🎉\n\n"
-        f"🎁 کمپین: {row['title']}\n"
-        f"👤 برنده: {row['first_name']} {username}\n"
-        f"🎁 جایزه: {row['prize']}\n\n"
-        "تبریک به برنده ❤️"
+    winner_name = (
+        row["first_name"]
+        or "برنده"
     )
 
-    sent = 0
+    message = (
+        "🏆🎉 برنده جدید محفل خوش شانس ها 🎉🏆\n\n"
+        f"🎁 کمپین: {row['title'] or '-'}\n"
+        f"🏆 جایزه: {row['prize'] or '-'}\n\n"
+        f"🥇 برنده: {winner_name}\n"
+    )
 
-    for user in users:
+    try:
 
-        try:
+        await context.bot.send_message(
+            chat_id=channel,
+            text=message
+        )
 
-            await context.bot.send_message(
-                chat_id=user["id"],
-                text=announcement
-            )
+    except Exception as e:
 
-            sent += 1
-
-        except Exception:
-            pass
+        logger.exception(
+            "Winner announcement error: %s",
+            e
+        )
 
     await update.message.reply_text(
-        f"✅ برنده اعلام شد.\n"
-        f"📨 ارسال موفق: {sent}"
+        "✅ برنده اعلام شد."
     )
 
 
@@ -2297,27 +3024,37 @@ async def announce_command(update, context):
 # ARCHIVE ADMIN
 # =========================================================
 
-async def archive_command(update, context):
+async def archive_campaign(update, context):
+
     if not await admin_required(update):
         return
 
-    if not context.args or not context.args[0].isdigit():
+    if not context.args:
 
         await update.message.reply_text(
-            "فرمت:\n/archive 1"
+            "مثال:\n/archive 1"
+        )
+
+        return
+
+    try:
+        campaign_id = int(
+            context.args[0]
+        )
+    except Exception:
+        await update.message.reply_text(
+            "❌ ID نامعتبر."
         )
         return
 
-    campaign_id = int(context.args[0])
-
-    conn = get_db()
+    conn = db()
 
     conn.execute(
         """
         UPDATE campaigns
-        SET archived = 1,
-            active = 0
-        WHERE id = ?
+        SET archived=1,
+            active=0
+        WHERE id=?
         """,
         (campaign_id,)
     )
@@ -2326,7 +3063,7 @@ async def archive_command(update, context):
     conn.close()
 
     await update.message.reply_text(
-        f"🗃 کمپین {campaign_id} به آرشیو منتقل شد."
+        "🗄 کمپین به آرشیو منتقل شد."
     )
 
 
@@ -2334,46 +3071,59 @@ async def archive_command(update, context):
 # BROADCAST
 # =========================================================
 
-async def broadcast_command(update, context):
+async def broadcast(update, context):
+
     if not await admin_required(update):
         return
 
-    text = " ".join(context.args).strip()
+    text = update.message.text[
+        len("/broadcast"):
+    ].strip()
 
     if not text:
 
         await update.message.reply_text(
             "فرمت:\n/broadcast متن پیام"
         )
+
         return
 
-    conn = get_db()
+    conn = db()
 
-    users = conn.execute(
+    rows = conn.execute(
         "SELECT id FROM users"
     ).fetchall()
 
     conn.close()
 
     sent = 0
+    failed = 0
 
-    for user in users:
+    await update.message.reply_text(
+        f"📢 ارسال پیام به {len(rows)} کاربر شروع شد..."
+    )
+
+    for row in rows:
 
         try:
 
             await context.bot.send_message(
-                chat_id=user["id"],
+                chat_id=row["id"],
                 text=text
             )
 
             sent += 1
 
+            await asyncio.sleep(0.05)
+
         except Exception:
-            pass
+
+            failed += 1
 
     await update.message.reply_text(
-        f"📢 پیام همگانی ارسال شد.\n"
-        f"تعداد موفق: {sent}"
+        "✅ ارسال تمام شد.\n\n"
+        f"موفق: {sent}\n"
+        f"ناموفق: {failed}"
     )
 
 
@@ -2381,139 +3131,18 @@ async def broadcast_command(update, context):
 # TICKETS
 # =========================================================
 
-async def tickets_command(update, context):
+async def tickets_admin(update, context):
+
     if not await admin_required(update):
         return
 
-    conn = get_db()
+    conn = db()
 
     rows = conn.execute(
         """
         SELECT *
         FROM support_tickets
-        WHERE status = 'open'
-        ORDER BY id DESC
-        LIMIT 30
-        """
-    ).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await update.message.reply_text(
-            "💬 درخواست باز وجود ندارد."
-        )
-        return
-
-    text = "💬 درخواست‌های پشتیبانی باز\n\n"
-
-    for row in rows:
-
-        text += (
-            f"🎫 Ticket: {row['id']}\n"
-            f"👤 User: {row['user_id']}\n"
-            f"💬 {row['message']}\n\n"
-        )
-
-    await update.message.reply_text(text[:4000])
-
-
-# =========================================================
-# REPLY
-# =========================================================
-
-async def reply_command(update, context):
-    if not await admin_required(update):
-        return
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "فرمت:\n/reply USER_ID متن پاسخ"
-        )
-        return
-
-    if not context.args[0].isdigit():
-
-        await update.message.reply_text(
-            "USER_ID باید عدد باشد."
-        )
-        return
-
-    user_id = int(context.args[0])
-    reply_text = " ".join(context.args[1:])
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "💬 پاسخ پشتیبانی محفل:\n\n"
-                f"{reply_text}"
-            )
-        )
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            f"❌ ارسال پیام انجام نشد:\n{e}"
-        )
-        return
-
-    conn = get_db()
-
-    ticket = conn.execute(
-        """
-        SELECT id
-        FROM support_tickets
-        WHERE user_id = ?
-        AND status = 'open'
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (user_id,)
-    ).fetchone()
-
-    if ticket:
-
-        conn.execute(
-            """
-            UPDATE support_tickets
-            SET status = 'closed',
-                admin_reply = ?,
-                replied_at = ?
-            WHERE id = ?
-            """,
-            (
-                reply_text,
-                datetime.utcnow().isoformat(),
-                ticket["id"]
-            )
-        )
-
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text(
-        "✅ پاسخ برای کاربر ارسال شد."
-    )
-
-
-# =========================================================
-# LOGS
-# =========================================================
-
-async def logs_command(update, context):
-    if not await admin_required(update):
-        return
-
-    conn = get_db()
-
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM operation_logs
+        WHERE status='open'
         ORDER BY id DESC
         LIMIT 50
         """
@@ -2524,29 +3153,148 @@ async def logs_command(update, context):
     if not rows:
 
         await update.message.reply_text(
-            "گزارشی ثبت نشده است."
+            "🎧 تیکت باز نداریم."
         )
+
         return
 
-    text = "📋 گزارش عملیات\n\n"
+    text = "🎧 تیکت‌های باز:\n\n"
 
     for row in rows:
 
         text += (
-            f"👤 Admin: {row['admin_id']}\n"
-            f"⚙️ {row['action']}\n"
-            f"📝 {row['details']}\n"
-            f"🕐 {row['created_at']}\n\n"
+            f"#{row['id']}\n"
+            f"User: {row['user_id']}\n"
+            f"{row['message']}\n\n"
+            f"/reply {row['user_id']} متن پاسخ\n\n"
         )
 
-    await update.message.reply_text(text[:4000])
+    await update.message.reply_text(text)
+
+
+async def reply_ticket(update, context):
+
+    if not await admin_required(update):
+        return
+
+    if len(context.args) < 2:
+
+        await update.message.reply_text(
+            "فرمت:\n"
+            "/reply USER_ID متن پاسخ"
+        )
+
+        return
+
+    try:
+
+        user_id = int(
+            context.args[0]
+        )
+
+    except Exception:
+
+        await update.message.reply_text(
+            "❌ USER_ID نامعتبر."
+        )
+
+        return
+
+    reply_text = " ".join(
+        context.args[1:]
+    )
+
+    conn = db()
+
+    conn.execute(
+        """
+        UPDATE support_tickets
+        SET status='closed',
+            admin_reply=?,
+            replied_at=?
+        WHERE user_id=?
+        AND status='open'
+        """,
+        (
+            reply_text,
+            datetime.utcnow().isoformat(),
+            user_id
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎧 پاسخ پشتیبانی:\n\n"
+                + reply_text
+            )
+        )
+
+        await update.message.reply_text(
+            "✅ پاسخ ارسال شد."
+        )
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            f"❌ ارسال پاسخ انجام نشد:\n{e}"
+        )
 
 
 # =========================================================
-# BUTTON HANDLER
+# LOGS
+# =========================================================
+
+async def logs_admin(update, context):
+
+    if not await admin_required(update):
+        return
+
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM operation_logs
+        ORDER BY id DESC
+        LIMIT 100
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            "لاگی وجود ندارد."
+        )
+
+        return
+
+    text = "📜 آخرین عملیات:\n\n"
+
+    for row in rows:
+
+        text += (
+            f"{row['created_at']}\n"
+            f"Admin: {row['admin_id']}\n"
+            f"{row['action']}\n\n"
+        )
+
+    await update.message.reply_text(text)
+
+
+# =========================================================
+# CALLBACK HANDLER
 # =========================================================
 
 async def button_handler(update, context):
+
     query = update.callback_query
 
     await query.answer()
@@ -2554,80 +3302,127 @@ async def button_handler(update, context):
     data = query.data
 
     if data == "campaigns":
-        await show_campaigns(query)
+
+        await show_campaigns(
+            update,
+            context
+        )
 
     elif data == "profile":
-        await show_profile(query)
+
+        await show_profile(
+            update,
+            context
+        )
 
     elif data == "chances":
-        await show_chances(query)
+
+        await show_chances(
+            update,
+            context
+        )
 
     elif data == "invite":
-        await show_invite(query)
+
+        await show_invite(
+            update,
+            context
+        )
 
     elif data == "history":
-        await show_history(query)
+
+        await show_history(
+            update,
+            context
+        )
 
     elif data == "winners":
-        await show_winners(query)
+
+        await show_winners(
+            update,
+            context
+        )
 
     elif data == "archive":
-        await show_archive(query)
+
+        await show_archive(
+            update,
+            context
+        )
 
     elif data == "rules":
-        await show_rules(query)
+
+        await show_rules(
+            update,
+            context
+        )
 
     elif data == "support":
-        await show_support(query)
+
+        await show_support(
+            update,
+            context
+        )
 
     elif data.startswith("campaign_"):
 
-        campaign_id = data.split("_")[1]
-
-        if campaign_id.isdigit():
-            await show_campaign_details(
-                query,
-                int(campaign_id)
-            )
-
-    elif data.startswith("rules_campaign_"):
-
-        campaign_id = data.replace(
-            "rules_campaign_",
-            ""
+        campaign_id = int(
+            data.split("_", 1)[1]
         )
 
-        if campaign_id.isdigit():
-            await show_campaign_rules(
-                query,
-                int(campaign_id)
-            )
+        await show_campaign_details(
+            update,
+            context,
+            campaign_id
+        )
+
+    elif data.startswith("rules_"):
+
+        campaign_id = int(
+            data.split("_", 1)[1]
+        )
+
+        await show_campaign_rules(
+            update,
+            context,
+            campaign_id
+        )
 
     elif data.startswith("accept_"):
 
-        campaign_id = data.replace(
-            "accept_",
-            ""
+        campaign_id = int(
+            data.split("_", 1)[1]
         )
 
-        if campaign_id.isdigit():
-            await accept_rules(
-                query,
-                int(campaign_id)
-            )
+        await accept_rules(
+            update,
+            context,
+            campaign_id
+        )
 
     elif data.startswith("join_"):
 
-        campaign_id = data.replace(
-            "join_",
-            ""
+        campaign_id = int(
+            data.split("_", 1)[1]
         )
 
-        if campaign_id.isdigit():
-            await join_campaign(
-                query,
-                int(campaign_id)
-            )
+        await join_campaign(
+            update,
+            context,
+            campaign_id
+        )
+
+
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(update, context):
+
+    logger.exception(
+        "Unhandled bot error",
+        exc_info=context.error
+    )
 
 
 # =========================================================
@@ -2635,21 +3430,241 @@ async def button_handler(update, context):
 # =========================================================
 
 async def main():
-    token = os.environ.get("BOT_TOKEN")
 
-    if not token:
-        raise RuntimeError(
-            "BOT_TOKEN تنظیم نشده است."
-        )
+    bot_token = os.environ.get(
+        "BOT_TOKEN"
+    )
 
     render_url = os.environ.get(
         "RENDER_EXTERNAL_URL"
     )
 
-    if not render_url:
+    if not bot_token:
+
         raise RuntimeError(
-            "RENDER_EXTERNAL_URL تنظیم نشده است."
+            "BOT_TOKEN is not configured."
         )
+
+    if not render_url:
+
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL is not configured."
+        )
+
+    init_db()
+
+    app = (
+        Application
+        .builder()
+        .token(bot_token)
+        .build()
+    )
+
+    # ---------------- USER ----------------
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    # ---------------- ADMIN ----------------
+
+    app.add_handler(
+        CommandHandler(
+            "admin",
+            admin_panel
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "stats",
+            stats
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "networkstatus",
+            network_status_command
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "igfollowers",
+            set_instagram_followers
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "followers",
+            set_followers
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "activation",
+            set_activation
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "maxfollowers",
+            set_max_followers
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "dailyprize",
+            set_daily_prize
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "newcampaign",
+            new_campaign
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "campaignsadmin",
+            campaigns_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "activate",
+            activate_campaign
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "deactivate",
+            deactivate_campaign
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "drawdate",
+            set_draw_date
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "rulesadmin",
+            rules_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "users",
+            users_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "referrals",
+            referrals_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "chancesadmin",
+            chances_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "participants",
+            participants_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "winner",
+            set_winner
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "announce",
+            announce_winner
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "archive",
+            archive_campaign
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "broadcast",
+            broadcast
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "tickets",
+            tickets_admin
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "reply",
+            reply_ticket
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "logs",
+            logs_admin
+        )
+    )
+
+    # ---------------- SUPPORT ----------------
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            handle_support_message
+        )
+    )
+
+    app.add_error_handler(
+        error_handler
+    )
 
     port = int(
         os.environ.get(
@@ -2658,145 +3673,69 @@ async def main():
         )
     )
 
-    init_db()
+    render_url = render_url.rstrip("/")
 
-    app = (
-        Application.builder()
-        .token(token)
-        .build()
-    )
-
-    # USER COMMANDS
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    # ADMIN COMMANDS
-    app.add_handler(
-        CommandHandler("admin", admin_command)
-    )
-
-    app.add_handler(
-        CommandHandler("stats", stats_command)
-    )
-
-    app.add_handler(
-        CommandHandler("followers", followers_command)
-    )
-
-    app.add_handler(
-        CommandHandler("activation", activation_command)
-    )
-
-    app.add_handler(
-        CommandHandler("maxfollowers", maxfollowers_command)
-    )
-
-    app.add_handler(
-        CommandHandler("dailyprize", dailyprize_command)
-    )
-
-    app.add_handler(
-        CommandHandler("newcampaign", newcampaign_command)
-    )
-
-    app.add_handler(
-        CommandHandler("campaignsadmin", campaignsadmin_command)
-    )
-
-    app.add_handler(
-        CommandHandler("activate", activate_command)
-    )
-
-    app.add_handler(
-        CommandHandler("deactivate", deactivate_command)
-    )
-
-    app.add_handler(
-        CommandHandler("drawdate", drawdate_command)
-    )
-
-    app.add_handler(
-        CommandHandler("rulesadmin", rulesadmin_command)
-    )
-
-    app.add_handler(
-        CommandHandler("users", users_command)
-    )
-
-    app.add_handler(
-        CommandHandler("referrals", referrals_command)
-    )
-
-    app.add_handler(
-        CommandHandler("chancesadmin", chancesadmin_command)
-    )
-
-    app.add_handler(
-        CommandHandler("participants", participants_command)
-    )
-
-    app.add_handler(
-        CommandHandler("winner", winner_command)
-    )
-
-    app.add_handler(
-        CommandHandler("announce", announce_command)
-    )
-
-    app.add_handler(
-        CommandHandler("archive", archive_command)
-    )
-
-    app.add_handler(
-        CommandHandler("broadcast", broadcast_command)
-    )
-
-    app.add_handler(
-        CommandHandler("tickets", tickets_command)
-    )
-
-    app.add_handler(
-        CommandHandler("reply", reply_command)
-    )
-
-    app.add_handler(
-        CommandHandler("logs", logs_command)
-    )
-
-    # BUTTONS
-    app.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-
-    # TEXT / SUPPORT
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            receive_support_message
-        )
-    )
-
+    # Initialize application
     await app.initialize()
+
     await app.start()
 
+    # Webhook
     await app.updater.start_webhook(
         listen="0.0.0.0",
         port=port,
         url_path="telegram",
-        webhook_url=f"{render_url}/telegram",
+        webhook_url=(
+            f"{render_url}/telegram"
+        ),
     )
 
-    logging.info(
-        "MahfelShans bot is running."
+    logger.info(
+        "MahfelShansBot started."
     )
 
-    await asyncio.Event().wait()
+    logger.info(
+        "Network update interval: %s hours",
+        NETWORK_UPDATE_HOURS
+    )
+
+    # Automatic network updater
+    network_task = asyncio.create_task(
+        periodic_network_update(app)
+    )
+
+    try:
+
+        while True:
+
+            await asyncio.sleep(3600)
+
+    except asyncio.CancelledError:
+
+        pass
+
+    finally:
+
+        network_task.cancel()
+
+        try:
+            await network_task
+        except asyncio.CancelledError:
+            pass
+
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Bot stopped."
+        )
