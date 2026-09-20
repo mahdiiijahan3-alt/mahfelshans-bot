@@ -3,7 +3,10 @@ import sqlite3
 import logging
 import random
 import asyncio
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 import requests
 
@@ -12,24 +15,28 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
 from telegram.constants import ParseMode
-
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
 
 # ============================================================
-# MAHFEL SHANS HA
-# محفل خوش‌شانس‌ها
-# MAIN.PY - CLEAN VERSION
+# LOGGING
 # ============================================================
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger("MAHFELSHANS")
 
 
 # ============================================================
@@ -40,295 +47,309 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 BOT_USERNAME = os.getenv(
     "BOT_USERNAME",
-    "MahfelShansBot"
-).replace("@", "").strip()
+    "MahfelShansBot",
+).strip().lstrip("@")
 
 TELEGRAM_CHANNEL = os.getenv(
     "TELEGRAM_CHANNEL",
-    "@MahfelShans"
+    "@MahfelShans",
 ).strip()
 
 INSTAGRAM_URL = os.getenv(
     "INSTAGRAM_URL",
-    "https://instagram.com/MAHFELSHANS"
+    "https://instagram.com/MAHFELSHANS",
 ).strip()
 
 YOUTUBE_URL = os.getenv(
     "YOUTUBE_URL",
-    "https://youtube.com/@mahfelshans"
+    "https://youtube.com/@mahfelshans",
 ).strip()
 
 SUPPORT_USERNAME = os.getenv(
     "SUPPORT_USERNAME",
-    "@MahdiJahanshahi"
-).strip()
+    "",
+).strip().lstrip("@")
 
 DATABASE = os.getenv(
     "DATABASE",
-    "mahfelshans.db"
+    "mahfelshans.db",
 ).strip()
 
-YOUTUBE_API_KEY = os.getenv(
-    "YOUTUBE_API_KEY",
-    ""
+ADMIN_IDS_RAW = os.getenv(
+    "ADMIN_IDS",
+    "",
 ).strip()
 
-YOUTUBE_CHANNEL_ID = os.getenv(
-    "YOUTUBE_CHANNEL_ID",
-    ""
-).strip()
+ACTIVATION_TARGET = int(
+    os.getenv("ACTIVATION_TARGET", "100000")
+)
 
-RENDER_EXTERNAL_URL = os.getenv(
-    "RENDER_EXTERNAL_URL",
-    ""
-).strip()
+# ثبت‌نام رایگان روشن است
+FREE_REGISTRATION_ENABLED = True
+
+# ثبت‌نام پولی فعلاً خاموش است
+PAID_REGISTRATION_ENABLED = False
+
+# بررسی عضویت تلگرام توسط خود ربات
+TELEGRAM_MEMBERSHIP_REQUIRED = (
+    os.getenv("TELEGRAM_MEMBERSHIP_REQUIRED", "true").lower()
+    in ("1", "true", "yes", "on")
+)
+
+# ارسال خودکار تبلیغ به کانال
+AUTO_POST_ENABLED = (
+    os.getenv("AUTO_POST_ENABLED", "true").lower()
+    in ("1", "true", "yes", "on")
+)
+
+AUTO_POST_HOURS = float(
+    os.getenv("AUTO_POST_HOURS", "2")
+)
 
 PORT = int(
     os.getenv("PORT", "10000")
 )
 
-WEBHOOK_PATH = os.getenv(
-    "WEBHOOK_PATH",
-    "mahfelshans"
-).strip("/")
+YOUTUBE_API_KEY = os.getenv(
+    "YOUTUBE_API_KEY",
+    "",
+).strip()
+
+YOUTUBE_CHANNEL_ID = os.getenv(
+    "YOUTUBE_CHANNEL_ID",
+    "",
+).strip()
 
 
-# ------------------------------------------------------------
-# ADMIN IDS
-# ------------------------------------------------------------
+def parse_admin_ids():
+    result = []
 
-ADMIN_IDS = set()
+    for item in ADMIN_IDS_RAW.split(","):
+        item = item.strip()
 
-for value in os.getenv("ADMIN_IDS", "").split(","):
-    value = value.strip()
+        if not item:
+            continue
 
-    if value:
         try:
-            ADMIN_IDS.add(int(value))
+            result.append(int(item))
         except ValueError:
-            pass
+            logger.warning("Invalid ADMIN_IDS value: %s", item)
+
+    return result
 
 
-# ------------------------------------------------------------
-# SYSTEM SETTINGS
-# ------------------------------------------------------------
-
-ACTIVATION_TARGET = int(
-    os.getenv(
-        "ACTIVATION_TARGET",
-        "100000"
-    )
-)
-
-AUTO_POST_ENABLED = (
-    os.getenv(
-        "AUTO_POST_ENABLED",
-        "1"
-    ).lower()
-    in ("1", "true", "yes", "on")
-)
-
-AUTO_POST_HOURS = int(
-    os.getenv(
-        "AUTO_POST_HOURS",
-        "2"
-    )
-)
-
-RULES_VERSION = "2.0"
-
-# رایگان فعال
-FREE_REGISTRATION_ENABLED = True
-
-# پرداختی فعلاً خاموش
-PAID_REGISTRATION_ENABLED = False
-
-# عضویت تلگرام برای شرایط مسابقه
-TELEGRAM_MEMBERSHIP_REQUIRED = True
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(
-    "MAHFELSHANS"
-)
+ADMIN_IDS = parse_admin_ids()
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def db():
-    connection = sqlite3.connect(
+DB_LOCK = threading.Lock()
+
+
+def db_connect():
+    conn = sqlite3.connect(
         DATABASE,
-        check_same_thread=False,
         timeout=30,
+        check_same_thread=False,
     )
-
-    connection.row_factory = sqlite3.Row
-
-    return connection
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def now():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+def db_execute(query, params=(), fetchone=False, fetchall=False, commit=True):
+    with DB_LOCK:
+        conn = db_connect()
+
+        try:
+            cur = conn.cursor()
+            cur.execute(query, params)
+
+            if commit:
+                conn.commit()
+
+            if fetchone:
+                return cur.fetchone()
+
+            if fetchall:
+                return cur.fetchall()
+
+            return cur.lastrowid
+
+        finally:
+            conn.close()
 
 
-def init_db():
-    connection = db()
-    cursor = connection.cursor()
+def init_database():
+    with DB_LOCK:
+        conn = db_connect()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE NOT NULL,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            referred_by INTEGER DEFAULT NULL,
-            referral_count INTEGER DEFAULT 0,
-            chances INTEGER DEFAULT 1,
-            registered INTEGER DEFAULT 0,
-            registration_type TEXT DEFAULT NULL,
-            rules_accepted INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            registered_at TEXT DEFAULT NULL,
-            last_seen TEXT NOT NULL
-        )
-    """)
+        try:
+            cur = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            inviter_id INTEGER NOT NULL,
-            invited_id INTEGER UNIQUE NOT NULL,
-            chance_awarded INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER UNIQUE NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    registered INTEGER DEFAULT 0,
+                    registration_type TEXT DEFAULT 'free',
+                    rules_accepted INTEGER DEFAULT 0,
+                    instagram_follow INTEGER DEFAULT 0,
+                    youtube_follow INTEGER DEFAULT 0,
+                    telegram_member INTEGER DEFAULT 0,
+                    chances INTEGER DEFAULT 0,
+                    referred_by INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS campaigns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT,
-            prize TEXT NOT NULL,
-            active INTEGER DEFAULT 1,
-            draw_completed INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS referrals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    referrer_id INTEGER NOT NULL,
+                    referred_id INTEGER UNIQUE NOT NULL,
+                    successful INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS participations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            campaign_id INTEGER NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            chance_count INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL,
-            UNIQUE(campaign_id, telegram_id)
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS campaigns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    prize TEXT,
+                    status TEXT DEFAULT 'open',
+                    draw_allowed INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS winners (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            campaign_id INTEGER NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            prize TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS participations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    campaign_id INTEGER NOT NULL,
+                    chances INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(user_id, campaign_id)
+                )
+            """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rule_acceptances (
-            telegram_id INTEGER PRIMARY KEY,
-            version TEXT NOT NULL,
-            accepted_at TEXT NOT NULL
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS winners (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    campaign_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    telegram_id INTEGER NOT NULL,
+                    chances_at_draw INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS support_tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            admin_reply TEXT DEFAULT NULL,
-            status TEXT DEFAULT 'open',
-            created_at TEXT NOT NULL,
-            replied_at TEXT DEFAULT NULL
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rule_acceptances (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    rules_version TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    UNIQUE(telegram_id, rules_version)
+                )
+            """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS support_tickets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_telegram_id INTEGER NOT NULL,
+                    admin_telegram_id INTEGER,
+                    message TEXT NOT NULL,
+                    status TEXT DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    answered_at TEXT
+                )
+            """)
 
-    defaults = {
-        "instagram_followers": "0",
-        "youtube_followers": "0",
-        "telegram_followers": "0",
-        "activation_target": str(ACTIVATION_TARGET),
-        "networks_activated": "0",
-        "rules_version": RULES_VERSION,
-        "last_auto_post": "",
-        "last_youtube_check": "",
-    }
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
 
-    for key, value in defaults.items():
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO settings(
-                key,
-                value
-            )
-            VALUES (?, ?)
-            """,
-            (
-                key,
-                value,
-            ),
-        )
+            defaults = {
+                "instagram_followers": "0",
+                "youtube_followers": "0",
+                "telegram_followers": "0",
+                "activation_target": str(ACTIVATION_TARGET),
+                "network_activated": "0",
+                "rules_version": "1.0",
+                "free_registration_enabled": "1",
+                "paid_registration_enabled": "0",
+                "membership_required": "1",
+                "last_auto_post": "",
+            }
 
-    connection.commit()
+            for key, value in defaults.items():
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO settings(key, value)
+                    VALUES (?, ?)
+                    """,
+                    (key, value),
+                )
 
-    connection.close()
+            # مسابقه اصلی را فقط اگر وجود ندارد بساز
+            existing = cur.execute(
+                "SELECT id FROM campaigns ORDER BY id LIMIT 1"
+            ).fetchone()
+
+            if existing is None:
+                cur.execute(
+                    """
+                    INSERT INTO campaigns(
+                        title,
+                        description,
+                        prize,
+                        status,
+                        draw_allowed,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, 'open', 0, ?)
+                    """,
+                    (
+                        "اولین مسابقه محفل خوش‌شانس‌ها",
+                        "ثبت‌نام از همین حالا آزاد است. قرعه‌کشی پس از فعال شدن شبکه انجام می‌شود.",
+                        "جایزه طبق اطلاع‌رسانی رسمی محفل",
+                        now_iso(),
+                    ),
+                )
+
+            conn.commit()
+
+        finally:
+            conn.close()
 
 
-def get_setting(
-    key,
-    default=None
-):
-    connection = db()
+# ============================================================
+# HELPERS
+# ============================================================
 
-    row = connection.execute(
-        """
-        SELECT value
-        FROM settings
-        WHERE key=?
-        """,
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_setting(key, default=""):
+    row = db_execute(
+        "SELECT value FROM settings WHERE key = ?",
         (key,),
-    ).fetchone()
-
-    connection.close()
+        fetchone=True,
+        commit=False,
+    )
 
     if row is None:
         return default
@@ -336,769 +357,221 @@ def get_setting(
     return row["value"]
 
 
-def set_setting(
-    key,
-    value
-):
-    connection = db()
-
-    connection.execute(
+def set_setting(key, value):
+    db_execute(
         """
-        INSERT INTO settings(
-            key,
-            value
-        )
+        INSERT INTO settings(key, value)
         VALUES (?, ?)
         ON CONFLICT(key)
-        DO UPDATE SET
-            value=excluded.value
+        DO UPDATE SET value = excluded.value
         """,
-        (
-            key,
-            str(value),
-        ),
+        (key, str(value)),
     )
 
-    connection.commit()
-    connection.close()
 
-
-# ============================================================
-# USER FUNCTIONS
-# ============================================================
-
-def get_user(
-    telegram_id
-):
-    connection = db()
-
-    row = connection.execute(
+def get_user(telegram_id):
+    return db_execute(
         """
         SELECT *
         FROM users
-        WHERE telegram_id=?
+        WHERE telegram_id = ?
         """,
         (telegram_id,),
-    ).fetchone()
-
-    connection.close()
-
-    return row
+        fetchone=True,
+        commit=False,
+    )
 
 
-def create_or_update_user(
-    telegram_user
-):
-    connection = db()
-
-    existing = connection.execute(
-        """
-        SELECT telegram_id
-        FROM users
-        WHERE telegram_id=?
-        """,
-        (telegram_user.id,),
-    ).fetchone()
+def ensure_user(tg_user):
+    existing = get_user(tg_user.id)
 
     if existing:
-        connection.execute(
+        db_execute(
             """
             UPDATE users
-            SET
-                username=?,
-                first_name=?,
-                last_name=?,
-                last_seen=?
-            WHERE telegram_id=?
+            SET username = ?,
+                first_name = ?,
+                last_name = ?,
+                updated_at = ?
+            WHERE telegram_id = ?
             """,
             (
-                telegram_user.username,
-                telegram_user.first_name,
-                telegram_user.last_name,
-                now(),
-                telegram_user.id,
-            ),
-        )
-    else:
-        connection.execute(
-            """
-            INSERT INTO users(
-                telegram_id,
-                username,
-                first_name,
-                last_name,
-                chances,
-                registered,
-                rules_accepted,
-                created_at,
-                last_seen
-            )
-            VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?)
-            """,
-            (
-                telegram_user.id,
-                telegram_user.username,
-                telegram_user.first_name,
-                telegram_user.last_name,
-                now(),
-                now(),
+                tg_user.username or "",
+                tg_user.first_name or "",
+                tg_user.last_name or "",
+                now_iso(),
+                tg_user.id,
             ),
         )
 
-    connection.commit()
-    connection.close()
+        return get_user(tg_user.id)
 
-
-def accept_rules(
-    telegram_id
-):
-    connection = db()
-
-    connection.execute(
+    db_execute(
         """
-        UPDATE users
-        SET rules_accepted=1
-        WHERE telegram_id=?
-        """,
-        (telegram_id,),
-    )
-
-    connection.execute(
-        """
-        INSERT INTO rule_acceptances(
+        INSERT INTO users(
             telegram_id,
-            version,
-            accepted_at
+            username,
+            first_name,
+            last_name,
+            created_at,
+            updated_at
         )
-        VALUES (?, ?, ?)
-        ON CONFLICT(telegram_id)
-        DO UPDATE SET
-            version=excluded.version,
-            accepted_at=excluded.accepted_at
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
-            telegram_id,
-            get_setting(
-                "rules_version",
-                RULES_VERSION
-            ),
-            now(),
+            tg_user.id,
+            tg_user.username or "",
+            tg_user.first_name or "",
+            tg_user.last_name or "",
+            now_iso(),
+            now_iso(),
         ),
     )
 
-    connection.commit()
-    connection.close()
+    return get_user(tg_user.id)
 
 
-def register_user(
-    telegram_id,
-    registration_type="free"
-):
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE telegram_id=?
-        """,
-        (telegram_id,),
-    ).fetchone()
-
-    if not row:
-        connection.close()
-        return False, "user_not_found"
-
-    if not row["rules_accepted"]:
-        connection.close()
-        return False, "rules_not_accepted"
-
-    if row["registered"]:
-        connection.close()
-        return False, "already_registered"
-
-    connection.execute(
-        """
-        UPDATE users
-        SET
-            registered=1,
-            registration_type=?,
-            registered_at=?
-        WHERE telegram_id=?
-        """,
-        (
-            registration_type,
-            now(),
-            telegram_id,
-        ),
-    )
-
-    connection.commit()
-
-    # --------------------------------------------------------
-    # REFERRAL REWARD
-    # فقط بعد از ثبت‌نام موفق دعوت‌شده
-    # --------------------------------------------------------
-
-    inviter_id = row["referred_by"]
-
-    if inviter_id:
-        referral = connection.execute(
-            """
-            SELECT *
-            FROM referrals
-            WHERE invited_id=?
-            """,
-            (telegram_id,),
-        ).fetchone()
-
-        if referral and not referral["chance_awarded"]:
-            connection.execute(
-                """
-                UPDATE users
-                SET
-                    referral_count=
-                        referral_count + 1,
-                    chances=
-                        chances + 1
-                WHERE telegram_id=?
-                """,
-                (inviter_id,),
-            )
-
-            connection.execute(
-                """
-                UPDATE referrals
-                SET chance_awarded=1
-                WHERE invited_id=?
-                """,
-                (telegram_id,),
-            )
-
-    connection.commit()
-    connection.close()
-
-    return True, "registered"
-
-
-# ============================================================
-# REFERRAL
-# ============================================================
-
-def save_referral(
-    inviter_id,
-    invited_id
-):
-    if inviter_id == invited_id:
-        return False
-
-    connection = db()
-
-    invited = connection.execute(
-        """
-        SELECT referred_by
-        FROM users
-        WHERE telegram_id=?
-        """,
-        (invited_id,),
-    ).fetchone()
-
-    inviter = connection.execute(
-        """
-        SELECT telegram_id
-        FROM users
-        WHERE telegram_id=?
-        """,
-        (inviter_id,),
-    ).fetchone()
-
-    if not invited or not inviter:
-        connection.close()
-        return False
-
-    if invited["referred_by"]:
-        connection.close()
-        return False
-
-    connection.execute(
-        """
-        UPDATE users
-        SET referred_by=?
-        WHERE telegram_id=?
-        """,
-        (
-            inviter_id,
-            invited_id,
-        ),
-    )
-
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO referrals(
-            inviter_id,
-            invited_id,
-            chance_awarded,
-            created_at
-        )
-        VALUES (?, ?, 0, ?)
-        """,
-        (
-            inviter_id,
-            invited_id,
-            now(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    return True
-
-
-# ============================================================
-# FORMATTING
-# ============================================================
-
-def fmt_number(
-    value
-):
-    try:
-        return f"{int(value):,}"
-    except Exception:
-        return str(value)
-
-
-def is_admin(
-    user_id
-):
+def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+
+def network_activated():
+    return get_setting("network_activated", "0") == "1"
+
+
+def get_counts():
+    return {
+        "instagram": int(get_setting("instagram_followers", "0") or 0),
+        "youtube": int(get_setting("youtube_followers", "0") or 0),
+        "telegram": int(get_setting("telegram_followers", "0") or 0),
+    }
+
+
+def calculate_activation():
+    counts = get_counts()
+
+    return (
+        counts["instagram"] >= ACTIVATION_TARGET
+        and counts["youtube"] >= ACTIVATION_TARGET
+        and counts["telegram"] >= ACTIVATION_TARGET
+    )
+
+
+def update_activation_status():
+    active = calculate_activation()
+
+    set_setting(
+        "network_activated",
+        "1" if active else "0",
+    )
+
+    return active
+
+
+def rules_version():
+    return get_setting("rules_version", "1.0")
 
 
 # ============================================================
 # RULES
 # ============================================================
 
-def rules_text():
-    return (
-        "📜 <b>قوانین محفل خوش‌شانس‌ها</b>\n\n"
+RULES_TEXT = f"""
+<b>📜 قوانین رسمی محفل خوش‌شانس‌ها</b>
 
-        "1️⃣ <b>ثبت‌نام رایگان</b>\n"
-        "ثبت‌نام رایگان در مرحله فعلی فعال است و برای ورود "
-        "به لیست کاربران محفل هزینه‌ای ندارد.\n\n"
+1️⃣ ثبت‌نام رایگان در حال حاضر فعال است.
 
-        "2️⃣ <b>ثبت‌نام پولی</b>\n"
-        "گزینه ثبت‌نام پولی فعلاً غیرفعال است. "
-        "در صورت فعال شدن در آینده، قوانین و شرایط مربوط "
-        "قبل از استفاده اعلام خواهد شد.\n\n"
+2️⃣ ثبت‌نام پولی فعلاً غیرفعال است و تا زمان اعلام رسمی هیچ مبلغی از کاربران دریافت نمی‌شود.
 
-        "3️⃣ <b>پذیرش قوانین</b>\n"
-        "برای ثبت‌نام، مطالعه و پذیرش قوانین الزامی است.\n\n"
+3️⃣ ثبت‌نام مسابقه با «فعال‌سازی شبکه» دو موضوع جدا هستند.
+یعنی شما می‌توانید از همین حالا ثبت‌نام کنید، حتی اگر شبکه هنوز به {ACTIVATION_TARGET:,} نرسیده باشد.
 
-        "4️⃣ <b>دعوت دوستان</b>\n"
-        "هر کاربر می‌تواند لینک اختصاصی خود را برای دیگران ارسال کند. "
-        "در صورتی که فرد دعوت‌شده از طریق لینک شما وارد شود و "
-        "ثبت‌نام خود را با موفقیت کامل کند، طبق سیستم محفل "
-        "یک شانس اضافه برای دعوت‌کننده ثبت می‌شود.\n\n"
+4️⃣ هر کاربر پس از ثبت‌نام، طبق قوانین مسابقه شانس پایه دریافت می‌کند.
 
-        "5️⃣ <b>شبکه‌های اجتماعی</b>\n"
-        "برای اطلاع از مسابقات و شرایط جایزه، دنبال کردن "
-        "اینستاگرام، یوتیوب و عضویت در کانال رسمی تلگرام "
-        "توصیه و در صورت اعلام در قوانین همان مسابقه، الزامی است.\n\n"
+5️⃣ معرفی موفق افراد جدید می‌تواند برای معرف شانس اضافه ایجاد کند.
+معرفی زمانی موفق محسوب می‌شود که فرد جدید واقعاً از لینک معرفی وارد ربات و ثبت‌نام کند.
 
-        "6️⃣ <b>۱۰۰ هزار نفر</b>\n"
-        "رسیدن شبکه‌های محفل به حد نصاب اعلام‌شده، "
-        "مرحله فعال‌سازی قرعه‌کشی را مشخص می‌کند.\n\n"
+6️⃣ برای دریافت جایزه، رعایت شرایط اعلام‌شده مسابقه و عضویت در کانال تلگرام الزامی است.
 
-        "7️⃣ <b>ثبت‌نام مسابقات</b>\n"
-        "ثبت‌نام در فهرست مسابقات از مرحله رسیدن به ۱۰۰K "
-        "جداست. ممکن است مسابقه برای ثبت‌نام باز باشد، "
-        "اما اجرای قرعه‌کشی تا زمان فعال شدن شرایط آن انجام نشود.\n\n"
+7️⃣ دنبال کردن اینستاگرام و یوتیوب جزو شرایط اعلام‌شده محفل است.
+بررسی خودکار این دو شبکه فعلاً فعال نیست و روش بررسی نهایی در زمان اعلام مسابقه مشخص می‌شود.
 
-        "8️⃣ <b>بررسی شرایط</b>\n"
-        "شرایط لازم می‌تواند در هر مسابقه متفاوت باشد و "
-        "هنگام قرعه‌کشی نیز بررسی شود.\n\n"
+8️⃣ شمارش فعلی اینستاگرام و یوتیوب توسط مدیریت ثبت می‌شود.
+شمارش اعضای تلگرام توسط خود ربات قابل بررسی است.
 
-        "9️⃣ <b>نتیجه</b>\n"
-        "نتیجه مسابقات و اطلاعیه‌های رسمی فقط از مسیرهای رسمی "
-        "محفل اعلام می‌شود.\n\n"
+9️⃣ قرعه‌کشی فقط پس از فعال شدن شبکه انجام می‌شود.
+فعال شدن شبکه زمانی است که هر سه عدد اینستاگرام، یوتیوب و تلگرام به حداقل {ACTIVATION_TARGET:,} برسند.
 
-        "🔟 <b>تغییر قوانین</b>\n"
-        "هرگونه تغییر مهم در قوانین قبل از اعمال برای کاربران "
-        "اعلام خواهد شد.\n\n"
+🔟 در صورت باز شدن ثبت‌نام پولی در آینده، قوانین و شرایط آن قبل از پرداخت به کاربر نمایش داده می‌شود و پذیرش قوانین ثبت‌شده کاربر محفوظ خواهد بود.
 
-        "⚠️ اجرای هر مسابقه باید مطابق قوانین و مقررات محل "
-        "فعالیت و الزامات قانونی مربوطه باشد."
+1️⃣1️⃣ هیچ‌کس صرفاً با ثبت‌نام یا معرفی، برنده قطعی نیست.
+
+1️⃣2️⃣ نتیجه قرعه‌کشی و شرایط دریافت جایزه طبق قوانین همان مسابقه اعلام خواهد شد.
+
+1️⃣3️⃣ هرگونه تقلب، ثبت‌نام تکراری، سوءاستفاده از سیستم معرفی یا اطلاعات جعلی می‌تواند باعث حذف کاربر از مسابقه شود.
+
+1️⃣4️⃣ محفل خوش‌شانس‌ها حق دارد برای جلوگیری از تقلب، شرایط فنی و اجرایی مسابقات را با اطلاع‌رسانی رسمی به‌روزرسانی کند.
+
+<b>نسخه قوانین: {rules_version()}</b>
+"""
+
+
+def has_accepted_rules(user_id):
+    row = db_execute(
+        """
+        SELECT id
+        FROM rule_acceptances
+        WHERE telegram_id = ?
+          AND rules_version = ?
+        """,
+        (user_id, rules_version()),
+        fetchone=True,
+        commit=False,
     )
 
-
-# ============================================================
-# KEYBOARDS
-# ============================================================
-
-def start_keyboard():
-    buttons = [
-        [
-            InlineKeyboardButton(
-                "📜 مطالعه و پذیرش قوانین",
-                callback_data="rules"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🆘 راهنمای ثبت‌نام",
-                callback_data="guide"
-            )
-        ],
-    ]
-
-    return InlineKeyboardMarkup(buttons)
+    return row is not None
 
 
-def registration_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🆓 ثبت‌نام رایگان",
-                callback_data="register_free"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💳 ثبت‌نام پولی 🔒",
-                callback_data="paid_disabled"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📜 قوانین",
-                callback_data="rules"
-            )
-        ],
-    ])
-
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🎁 مسابقات",
-                callback_data="campaigns"
-            ),
-            InlineKeyboardButton(
-                "🎟 شانس‌های من",
-                callback_data="my_chances"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 دعوت دوستان",
-                callback_data="referral"
-            ),
-            InlineKeyboardButton(
-                "📋 ثبت‌نام من",
-                callback_data="my_registration"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📸 اینستاگرام",
-                url=INSTAGRAM_URL
-            ),
-            InlineKeyboardButton(
-                "▶️ یوتیوب",
-                url=YOUTUBE_URL
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📢 کانال تلگرام",
-                url=(
-                    "https://t.me/"
-                    f"{TELEGRAM_CHANNEL.lstrip('@')}"
-                )
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔎 بررسی شرایط",
-                callback_data="eligibility"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📈 وضعیت 100K",
-                callback_data="network"
-            ),
-            InlineKeyboardButton(
-                "📜 قوانین",
-                callback_data="rules"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🆘 پشتیبانی",
-                callback_data="support"
-            )
-        ],
-    ])
-
-
-def admin_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📊 وضعیت",
-                callback_data="admin_status"
-            ),
-            InlineKeyboardButton(
-                "👥 کاربران",
-                callback_data="admin_users"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🎁 مسابقات",
-                callback_data="admin_campaigns"
-            ),
-            InlineKeyboardButton(
-                "🎲 قرعه‌کشی",
-                callback_data="admin_draw"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📢 تبلیغ",
-                callback_data="admin_post"
-            ),
-            InlineKeyboardButton(
-                "📩 پشتیبانی",
-                callback_data="admin_support"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📈 شبکه‌ها",
-                callback_data="admin_networks"
-            ),
-            InlineKeyboardButton(
-                "▶️ یوتیوب",
-                callback_data="admin_youtube"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🏠 منوی اصلی",
-                callback_data="home"
-            )
-        ],
-    ])
-
-
-# ============================================================
-# NETWORKS
-# ============================================================
-
-def get_networks():
-    return {
-        "instagram": int(
-            get_setting(
-                "instagram_followers",
-                "0"
-            )
+def save_rules_acceptance(user_id):
+    db_execute(
+        """
+        INSERT OR IGNORE INTO rule_acceptances(
+            telegram_id,
+            rules_version,
+            accepted_at
+        )
+        VALUES (?, ?, ?)
+        """,
+        (
+            user_id,
+            rules_version(),
+            now_iso(),
         ),
-        "youtube": int(
-            get_setting(
-                "youtube_followers",
-                "0"
-            )
-        ),
-        "telegram": int(
-            get_setting(
-                "telegram_followers",
-                "0"
-            )
-        ),
-    }
-
-
-async def update_telegram_count(
-    bot
-):
-    try:
-        count = await bot.get_chat_member_count(
-            TELEGRAM_CHANNEL
-        )
-
-        set_setting(
-            "telegram_followers",
-            count
-        )
-
-        return count
-
-    except Exception as exc:
-        logger.warning(
-            "Telegram member count failed: %s",
-            exc
-        )
-
-        return None
-
-
-def check_activation():
-    networks = get_networks()
-
-    target = int(
-        get_setting(
-            "activation_target",
-            ACTIVATION_TARGET
-        )
     )
 
-    active = (
-        networks["instagram"] >= target
-        and
-        networks["youtube"] >= target
-        and
-        networks["telegram"] >= target
+    db_execute(
+        """
+        UPDATE users
+        SET rules_accepted = 1,
+            updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (now_iso(), user_id),
     )
-
-    set_setting(
-        "networks_activated",
-        "1" if active else "0"
-    )
-
-    return active
-
-
-def activation_text():
-    networks = get_networks()
-
-    target = int(
-        get_setting(
-            "activation_target",
-            ACTIVATION_TARGET
-        )
-    )
-
-    active = check_activation()
-
-    def progress(
-        name,
-        value
-    ):
-        percent = (
-            int(
-                min(
-                    100,
-                    value / target * 100
-                )
-            )
-            if target
-            else 0
-        )
-
-        return (
-            f"{name}: "
-            f"<b>{fmt_number(value)}</b> / "
-            f"{fmt_number(target)} "
-            f"({percent}%)"
-        )
-
-    if active:
-        return (
-            "🚀 <b>مرحله فعال‌سازی تکمیل شد!</b>\n\n"
-            "🎉 حد نصاب هر سه شبکه تکمیل شده است.\n"
-            "🎲 اجرای قرعه‌کشی‌های واجد شرایط می‌تواند فعال شود."
-        )
-
-    return (
-        "📈 <b>مسیر فعال‌سازی محفل</b>\n\n"
-        f"📸 {progress('Instagram', networks['instagram'])}\n"
-        f"▶️ {progress('YouTube', networks['youtube'])}\n"
-        f"📢 {progress('Telegram', networks['telegram'])}\n\n"
-        "🎯 حد نصاب فعلی هر شبکه: "
-        f"<b>{fmt_number(target)}</b>\n\n"
-        "⚠️ ثبت‌نام کاربران و ثبت‌نام در مسابقات "
-        "از این مرحله جداست؛ این عدد برای فعال شدن "
-        "مرحله قرعه‌کشی استفاده می‌شود."
-    )
-
-
-# ============================================================
-# YOUTUBE
-# ============================================================
-
-def fetch_youtube_followers():
-    if not YOUTUBE_API_KEY:
-        return None
-
-    if not YOUTUBE_CHANNEL_ID:
-        return None
-
-    try:
-        response = requests.get(
-            "https://www.googleapis.com/youtube/v3/channels",
-            params={
-                "part": "statistics",
-                "id": YOUTUBE_CHANNEL_ID,
-                "key": YOUTUBE_API_KEY,
-            },
-            timeout=20,
-        )
-
-        if response.status_code != 200:
-            logger.warning(
-                "YouTube HTTP %s",
-                response.status_code
-            )
-            return None
-
-        data = response.json()
-
-        items = data.get(
-            "items",
-            []
-        )
-
-        if not items:
-            return None
-
-        value = (
-            items[0]
-            .get("statistics", {})
-            .get("subscriberCount")
-        )
-
-        if value is None:
-            return None
-
-        return int(value)
-
-    except Exception as exc:
-        logger.warning(
-            "YouTube API error: %s",
-            exc
-        )
-
-        return None
 
 
 # ============================================================
 # TELEGRAM MEMBERSHIP
 # ============================================================
 
-async def check_telegram_membership(
-    bot,
-    user_id
-):
+async def check_telegram_membership(bot, user_id):
     if not TELEGRAM_MEMBERSHIP_REQUIRED:
         return True
 
     try:
         member = await bot.get_chat_member(
-            TELEGRAM_CHANNEL,
-            user_id
+            chat_id=TELEGRAM_CHANNEL,
+            user_id=user_id,
         )
 
         if member.status in (
@@ -1110,1303 +583,748 @@ async def check_telegram_membership(
 
         if member.status == "restricted":
             return bool(
-                getattr(
-                    member,
-                    "is_member",
-                    False
-                )
+                getattr(member, "is_member", False)
             )
 
+        return False
+
+    except TelegramError as exc:
+        logger.warning(
+            "Telegram membership check failed: %s",
+            exc,
+        )
         return False
 
     except Exception as exc:
-        logger.warning(
-            "Membership check failed: %s",
-            exc
+        logger.exception(
+            "Unexpected membership error: %s",
+            exc,
         )
-
         return False
 
 
-# ============================================================
-# PROMOTIONAL MESSAGE
-# ============================================================
-
-def promotional_text():
-    return (
-        "🔥🔥 <b>محفل خوش‌شانس‌ها در حال بزرگ شدن است!</b> 🔥🔥\n\n"
-
-        "🎁 مسابقات و جوایز ویژه در راه است.\n"
-        "🚀 هدف بزرگ ما: <b>100,000 نفر</b>\n\n"
-
-        "🎟 <b>همین حالا رایگان ثبت‌نام کن.</b>\n"
-        "👥 دوستانت را هم وارد محفل کن؛ "
-        "هر دعوت موفق طبق قوانین می‌تواند برایت "
-        "یک شانس اضافه بسازد.\n\n"
-
-        "📸 اینستاگرام:\n"
-        f"{INSTAGRAM_URL}\n\n"
-
-        "▶️ یوتیوب:\n"
-        f"{YOUTUBE_URL}\n\n"
-
-        "📢 کانال تلگرام:\n"
-        f"https://t.me/{TELEGRAM_CHANNEL.lstrip('@')}\n\n"
-
-        "⚠️ برای دریافت جایزه، رعایت شرایط اعلام‌شده "
-        "در قوانین همان مسابقه الزامی است.\n\n"
-
-        "🚨 <b>این پیام را برای دوستانت بفرست.</b>\n"
-        "هر عضو جدید یعنی یک قدم نزدیک‌تر به شروع مرحله "
-        "قرعه‌کشی. 🚀🔥"
+async def refresh_user_membership(bot, user_id):
+    member = await check_telegram_membership(
+        bot,
+        user_id,
     )
 
-
-# ============================================================
-# START
-# ============================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-
-    create_or_update_user(user)
-
-    # --------------------------------------------------------
-    # REFERRAL CODE
-    # --------------------------------------------------------
-
-    if context.args:
-        try:
-            inviter_id = int(
-                context.args[0]
-            )
-
-            save_referral(
-                inviter_id,
-                user.id
-            )
-
-        except Exception:
-            pass
-
-    existing = get_user(
-        user.id
-    )
-
-    if existing and existing["registered"]:
-        await update.message.reply_text(
-            "🔥 <b>خوش برگشتی!</b>\n\n"
-            "ثبت‌نامت قبلاً انجام شده است.\n"
-            "از منوی زیر همه امکانات محفل در دسترس توست.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
-        )
-
-        return
-
-    await update.message.reply_text(
-        "🎉 <b>به محفل خوش‌شانس‌ها خوش آمدید!</b>\n\n"
-
-        "🎁 ثبت‌نام فعلی <b>کاملاً رایگان</b> است.\n"
-        "👥 با دعوت موفق دوستان می‌توانی شانس اضافه بگیری.\n"
-        "🎁 مسابقات از بخش مسابقات قابل مشاهده و ثبت‌نام هستند.\n\n"
-
-        "⚠️ برای ورود به محفل ابتدا قوانین را "
-        "مطالعه و تأیید کن.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=start_keyboard(),
-    )
-
-
-# ============================================================
-# MY ID
-# ============================================================
-
-async def myid(
-    update,
-    context
-):
-    await update.message.reply_text(
-        "🆔 <b>Telegram ID شما:</b>\n\n"
-        f"<code>{update.effective_user.id}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# ADMIN COMMAND
-# ============================================================
-
-async def admin_command(
-    update,
-    context
-):
-    user_id = update.effective_user.id
-
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "❌ شما دسترسی ادمین ندارید.\n\n"
-            f"🆔 ID شما:\n"
-            f"<code>{user_id}</code>\n\n"
-            "این ID را در Environment Variable زیر قرار بده:\n"
-            "<code>ADMIN_IDS</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    await update.message.reply_text(
-        "🛠 <b>پنل مدیریت محفل خوش‌شانس‌ها</b>\n\n"
-        "از منوی زیر مدیریت کن:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_menu(),
-    )
-
-
-# ============================================================
-# ADMIN HELP
-# ============================================================
-
-async def adminhelp(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    await update.message.reply_text(
-        "🛠 <b>راهنمای ادمین</b>\n\n"
-
-        "/admin\n"
-        "پنل مدیریت\n\n"
-
-        "/myid\n"
-        "شناسه تلگرام\n\n"
-
-        "/status\n"
-        "وضعیت سیستم\n\n"
-
-        "/users\n"
-        "آمار کاربران\n\n"
-
-        "/igfollowers 100000\n"
-        "ثبت دستی Instagram\n\n"
-
-        "/ytfollowers\n"
-        "دریافت YouTube از API\n\n"
-
-        "/tgfollowers\n"
-        "دریافت تعداد Telegram\n\n"
-
-        "/createcampaign عنوان | توضیحات | جایزه\n"
-        "ساخت مسابقه\n\n"
-
-        "/campaigns\n"
-        "لیست مسابقات\n\n"
-
-        "/draw 1\n"
-        "قرعه‌کشی مسابقه شماره ۱\n\n"
-
-        "/postnow\n"
-        "ارسال تبلیغ فوری\n\n"
-
-        "/tickets\n"
-        "تیکت‌های پشتیبانی\n\n"
-
-        "/replyticket ID متن\n"
-        "پاسخ به تیکت",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-async def status(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    connection = db()
-
-    users = connection.execute(
-        "SELECT COUNT(*) c FROM users"
-    ).fetchone()["c"]
-
-    registered = connection.execute(
+    db_execute(
         """
-        SELECT COUNT(*) c
-        FROM users
-        WHERE registered=1
-        """
-    ).fetchone()["c"]
-
-    referrals = connection.execute(
-        "SELECT COUNT(*) c FROM referrals"
-    ).fetchone()["c"]
-
-    campaigns = connection.execute(
-        "SELECT COUNT(*) c FROM campaigns"
-    ).fetchone()["c"]
-
-    winners = connection.execute(
-        "SELECT COUNT(*) c FROM winners"
-    ).fetchone()["c"]
-
-    tickets = connection.execute(
-        """
-        SELECT COUNT(*) c
-        FROM support_tickets
-        WHERE status='open'
-        """
-    ).fetchone()["c"]
-
-    connection.close()
-
-    await update_telegram_count(
-        context.bot
-    )
-
-    networks = get_networks()
-
-    await update.message.reply_text(
-        "📊 <b>وضعیت کامل سیستم</b>\n\n"
-
-        f"👥 کل کاربران: <b>{fmt_number(users)}</b>\n"
-        f"✅ ثبت‌نام‌شده: <b>{fmt_number(registered)}</b>\n"
-        f"🤝 دعوت موفق: <b>{fmt_number(referrals)}</b>\n"
-        f"🎁 مسابقات: <b>{fmt_number(campaigns)}</b>\n"
-        f"🏆 برندگان: <b>{fmt_number(winners)}</b>\n"
-        f"🆘 تیکت باز: <b>{fmt_number(tickets)}</b>\n\n"
-
-        f"📸 Instagram: "
-        f"<b>{fmt_number(networks['instagram'])}</b>\n"
-
-        f"▶️ YouTube: "
-        f"<b>{fmt_number(networks['youtube'])}</b>\n"
-
-        f"📢 Telegram: "
-        f"<b>{fmt_number(networks['telegram'])}</b>\n\n"
-
-        f"🚀 فعال‌سازی 100K: "
-        f"<b>{'فعال' if check_activation() else 'در انتظار'}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# USERS
-# ============================================================
-
-async def users_command(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    connection = db()
-
-    total = connection.execute(
-        "SELECT COUNT(*) c FROM users"
-    ).fetchone()["c"]
-
-    registered = connection.execute(
-        """
-        SELECT COUNT(*) c
-        FROM users
-        WHERE registered=1
-        """
-    ).fetchone()["c"]
-
-    accepted = connection.execute(
-        """
-        SELECT COUNT(*) c
-        FROM users
-        WHERE rules_accepted=1
-        """
-    ).fetchone()["c"]
-
-    referrals = connection.execute(
-        "SELECT COUNT(*) c FROM referrals"
-    ).fetchone()["c"]
-
-    connection.close()
-
-    await update.message.reply_text(
-        "👥 <b>آمار کاربران</b>\n\n"
-        f"کل ورودی‌ها: <b>{fmt_number(total)}</b>\n"
-        f"قوانین پذیرفته: <b>{fmt_number(accepted)}</b>\n"
-        f"ثبت‌نام کامل: <b>{fmt_number(registered)}</b>\n"
-        f"دعوت موفق: <b>{fmt_number(referrals)}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# MANUAL INSTAGRAM
-# ============================================================
-
-async def igfollowers(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "مثال:\n"
-            "/igfollowers 100000"
-        )
-        return
-
-    try:
-        value = int(
-            context.args[0]
-            .replace(",", "")
-            .replace("٬", "")
-        )
-    except ValueError:
-        await update.message.reply_text(
-            "❌ عدد صحیح وارد کنید."
-        )
-        return
-
-    if value < 0:
-        await update.message.reply_text(
-            "❌ عدد نمی‌تواند منفی باشد."
-        )
-        return
-
-    set_setting(
-        "instagram_followers",
-        value
-    )
-
-    active = check_activation()
-
-    await update.message.reply_text(
-        "📸 <b>Instagram بروزرسانی شد.</b>\n\n"
-        f"تعداد: <b>{fmt_number(value)}</b>\n"
-        f"هدف: <b>{fmt_number(ACTIVATION_TARGET)}</b>\n\n"
-        f"🚀 وضعیت: "
-        f"<b>{'فعال' if active else 'در انتظار'}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# TELEGRAM COUNT
-# ============================================================
-
-async def tgfollowers(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    count = await update_telegram_count(
-        context.bot
-    )
-
-    if count is None:
-        await update.message.reply_text(
-            "❌ تعداد اعضای کانال دریافت نشد.\n\n"
-            "مطمئن شوید نام کانال صحیح است و ربات "
-            "دسترسی لازم را دارد."
-        )
-        return
-
-    active = check_activation()
-
-    await update.message.reply_text(
-        "📢 <b>Telegram بروزرسانی شد.</b>\n\n"
-        f"اعضا: <b>{fmt_number(count)}</b>\n"
-        f"هدف: <b>{fmt_number(ACTIVATION_TARGET)}</b>\n\n"
-        f"🚀 وضعیت: "
-        f"<b>{'فعال' if active else 'در انتظار'}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# YOUTUBE COUNT
-# ============================================================
-
-async def ytfollowers(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    count = fetch_youtube_followers()
-
-    if count is None:
-        await update.message.reply_text(
-            "❌ دریافت YouTube انجام نشد.\n\n"
-            "این موارد را بررسی کن:\n"
-            "YOUTUBE_API_KEY\n"
-            "YOUTUBE_CHANNEL_ID\n"
-            "فعال بودن YouTube Data API"
-        )
-        return
-
-    set_setting(
-        "youtube_followers",
-        count
-    )
-
-    set_setting(
-        "last_youtube_check",
-        now()
-    )
-
-    active = check_activation()
-
-    await update.message.reply_text(
-        "▶️ <b>YouTube بروزرسانی شد.</b>\n\n"
-        f"مشترکان: <b>{fmt_number(count)}</b>\n"
-        f"هدف: <b>{fmt_number(ACTIVATION_TARGET)}</b>\n\n"
-        f"🚀 وضعیت: "
-        f"<b>{'فعال' if active else 'در انتظار'}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================
-# CREATE CAMPAIGN
-# ============================================================
-
-async def createcampaign(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    raw = " ".join(
-        context.args
-    ).strip()
-
-    parts = [
-        item.strip()
-        for item in raw.split("|")
-    ]
-
-    if len(parts) < 3:
-        await update.message.reply_text(
-            "فرمت صحیح:\n\n"
-            "/createcampaign عنوان | توضیحات | جایزه\n\n"
-            "مثال:\n"
-            "/createcampaign مسابقه اول | "
-            "اولین مسابقه محفل | پژو"
-        )
-        return
-
-    connection = db()
-
-    cursor = connection.execute(
-        """
-        INSERT INTO campaigns(
-            title,
-            description,
-            prize,
-            active,
-            draw_completed,
-            created_at
-        )
-        VALUES (?, ?, ?, 1, 0, ?)
+        UPDATE users
+        SET telegram_member = ?,
+            updated_at = ?
+        WHERE telegram_id = ?
         """,
         (
-            parts[0],
-            parts[1],
-            parts[2],
-            now(),
+            1 if member else 0,
+            now_iso(),
+            user_id,
         ),
     )
 
-    campaign_id = cursor.lastrowid
+    return member
 
-    connection.commit()
-    connection.close()
 
-    await update.message.reply_text(
-        "✅ <b>مسابقه ساخته شد.</b>\n\n"
-        f"🆔 ID: <code>{campaign_id}</code>\n"
-        f"🎁 {parts[0]}\n"
-        f"🏆 جایزه: {parts[2]}\n\n"
-        "ℹ️ ثبت‌نام کاربران در مسابقه از فعال‌سازی "
-        "100K جداست.",
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🎟 ثبت‌نام مسابقه",
+                callback_data="register",
+            ),
+            InlineKeyboardButton(
+                "🏆 مسابقات",
+                callback_data="campaigns",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🎯 شانس‌های من",
+                callback_data="my_chances",
+            ),
+            InlineKeyboardButton(
+                "👥 دعوت دوستان",
+                callback_data="referral",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 وضعیت فعال‌سازی",
+                callback_data="activation",
+            ),
+            InlineKeyboardButton(
+                "✅ شرایط من",
+                callback_data="eligibility",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📸 اینستاگرام",
+                url=INSTAGRAM_URL,
+            ),
+            InlineKeyboardButton(
+                "▶️ یوتیوب",
+                url=YOUTUBE_URL,
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 کانال تلگرام",
+                url=f"https://t.me/{TELEGRAM_CHANNEL.lstrip('@')}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📜 قوانین",
+                callback_data="rules",
+            ),
+            InlineKeyboardButton(
+                "🎧 پشتیبانی",
+                callback_data="support",
+            ),
+        ],
+    ])
+
+
+def back_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🏠 منوی اصلی",
+                callback_data="home",
+            )
+        ]
+    ])
+
+
+def registration_menu():
+    paid_text = (
+        "💳 ثبت‌نام پولی 🔒"
+        if not PAID_REGISTRATION_ENABLED
+        else "💳 ثبت‌نام پولی"
+    )
+
+    paid_callback = (
+        "paid_disabled"
+        if not PAID_REGISTRATION_ENABLED
+        else "register_paid"
+    )
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🆓 ثبت‌نام رایگان",
+                callback_data="register_free",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                paid_text,
+                callback_data=paid_callback,
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📜 مشاهده قوانین",
+                callback_data="rules",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 بازگشت",
+                callback_data="home",
+            )
+        ],
+    ])
+
+
+def campaign_keyboard(campaigns):
+    buttons = []
+
+    for campaign in campaigns:
+        buttons.append([
+            InlineKeyboardButton(
+                f"🎟 {campaign['title']}",
+                callback_data=f"join:{campaign['id']}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔙 بازگشت",
+            callback_data="home",
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def support_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✉️ ارسال پیام به پشتیبانی",
+                callback_data="support_new",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 بازگشت",
+                callback_data="home",
+            )
+        ],
+    ])
+
+
+# ============================================================
+# TEXT
+# ============================================================
+
+def home_text(user):
+    registered = bool(user and user["registered"])
+    chances = int(user["chances"] if user else 0)
+
+    status = "✅ ثبت‌نام شده" if registered else "⭕ هنوز ثبت‌نام نکرده"
+
+    return f"""
+<b>🎉 محفل خوش‌شانس‌ها</b>
+
+جایی برای مسابقه، شانس و جایزه.
+
+<b>وضعیت شما:</b>
+{status}
+
+🎯 شانس فعلی: <b>{chances}</b>
+
+ثبت‌نام مسابقه از همین حالا امکان‌پذیر است.
+فعال شدن قرعه‌کشی موضوع جداگانه‌ای است و پس از رسیدن شبکه به هدف اعلام‌شده انجام می‌شود.
+
+از منوی زیر انتخاب کن:
+"""
+
+
+def activation_text():
+    counts = get_counts()
+
+    ig = counts["instagram"]
+    yt = counts["youtube"]
+    tg = counts["telegram"]
+
+    ig_ok = ig >= ACTIVATION_TARGET
+    yt_ok = yt >= ACTIVATION_TARGET
+    tg_ok = tg >= ACTIVATION_TARGET
+
+    status = (
+        "🟢 شبکه فعال شده است."
+        if network_activated()
+        else "🟡 شبکه هنوز فعال نشده است."
+    )
+
+    return f"""
+<b>📊 وضعیت فعال‌سازی محفل</b>
+
+{status}
+
+هدف فعال‌سازی: <b>{ACTIVATION_TARGET:,}</b>
+
+📸 اینستاگرام:
+<b>{ig:,}</b> {'✅' if ig_ok else '⏳'}
+
+▶️ یوتیوب:
+<b>{yt:,}</b> {'✅' if yt_ok else '⏳'}
+
+📢 تلگرام:
+<b>{tg:,}</b> {'✅' if tg_ok else '⏳'}
+
+<b>نکته مهم:</b>
+ثبت‌نام مسابقه منتظر فعال شدن شبکه نمی‌ماند.
+شما می‌توانید همین حالا ثبت‌نام کنید و شانس خود را جمع کنید.
+
+قرعه‌کشی فقط پس از فعال شدن شبکه انجام می‌شود.
+"""
+
+
+# ============================================================
+# REFERRAL
+# ============================================================
+
+def referral_link(user_id):
+    return (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start=ref_{user_id}"
+    )
+
+
+def process_referral(new_user_id, referrer_id):
+    if not referrer_id:
+        return False
+
+    if new_user_id == referrer_id:
+        return False
+
+    referrer = get_user(referrer_id)
+
+    if referrer is None:
+        return False
+
+    already = db_execute(
+        """
+        SELECT id
+        FROM referrals
+        WHERE referred_id = ?
+        """,
+        (new_user_id,),
+        fetchone=True,
+        commit=False,
+    )
+
+    if already:
+        return False
+
+    db_execute(
+        """
+        INSERT INTO referrals(
+            referrer_id,
+            referred_id,
+            successful,
+            created_at
+        )
+        VALUES (?, ?, 1, ?)
+        """,
+        (
+            referrer_id,
+            new_user_id,
+            now_iso(),
+        ),
+    )
+
+    db_execute(
+        """
+        UPDATE users
+        SET chances = chances + 1,
+            updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (
+            now_iso(),
+            referrer_id,
+        ),
+    )
+
+    return True
+
+
+# ============================================================
+# REGISTRATION
+# ============================================================
+
+async def register_free_user(update, context):
+    query = update.callback_query
+    user = query.from_user
+
+    await query.answer()
+
+    ensure_user(user)
+
+    if not FREE_REGISTRATION_ENABLED:
+        await query.edit_message_text(
+            "🛑 ثبت‌نام رایگان فعلاً غیرفعال است.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    if not has_accepted_rules(user.id):
+        await query.edit_message_text(
+            RULES_TEXT
+            + "\n\n<b>برای ثبت‌نام ابتدا باید قوانین را بپذیری.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ قوانین را می‌پذیرم",
+                        callback_data="accept_rules_register",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="register",
+                    )
+                ],
+            ]),
+        )
+        return
+
+    db_execute(
+        """
+        UPDATE users
+        SET registered = 1,
+            registration_type = 'free',
+            chances = CASE
+                WHEN chances < 1 THEN 1
+                ELSE chances
+            END,
+            updated_at = ?
+        WHERE telegram_id = ?
+        """,
+        (
+            now_iso(),
+            user.id,
+        ),
+    )
+
+    await query.edit_message_text(
+        """
+<b>🎉 ثبت‌نام شما با موفقیت انجام شد.</b>
+
+🆓 نوع ثبت‌نام: رایگان
+
+🎯 شما حداقل ۱ شانس پایه دارید.
+
+از اینجا به بعد می‌توانی با معرفی دوستان، شانس‌های بیشتری بگیری.
+
+⚠️ ثبت‌نام شما مستقل از فعال شدن شبکه است؛
+برای قرعه‌کشی، شرایط فعال‌سازی شبکه باید بعداً تکمیل شود.
+""",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
     )
 
 
 # ============================================================
-# CAMPAIGNS COMMAND
+# CAMPAIGNS
 # ============================================================
 
-async def campaigns_command(
-    update,
-    context
-):
-    connection = db()
-
-    rows = connection.execute(
+def get_open_campaigns():
+    return db_execute(
         """
         SELECT *
         FROM campaigns
-        WHERE active=1
-          AND draw_completed=0
+        WHERE status = 'open'
         ORDER BY id DESC
-        """
-    ).fetchall()
+        """,
+        fetchall=True,
+        commit=False,
+    )
 
-    connection.close()
 
-    if not rows:
-        await update.message.reply_text(
-            "🎁 در حال حاضر مسابقه فعالی وجود ندارد."
+async def show_campaigns(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    campaigns = get_open_campaigns()
+
+    if not campaigns:
+        await query.edit_message_text(
+            """
+🏆 <b>مسابقات</b>
+
+در حال حاضر مسابقه فعالی وجود ندارد.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
         )
         return
 
-    text = "🎁 <b>مسابقات فعال</b>\n\n"
+    text = "<b>🏆 مسابقات فعال</b>\n\n"
 
-    for row in rows:
+    for campaign in campaigns:
         text += (
-            f"#{row['id']} — "
-            f"<b>{row['title']}</b>\n"
-            f"🏆 {row['prize']}\n\n"
+            f"🎟 <b>{campaign['title']}</b>\n"
+            f"{campaign['description'] or ''}\n"
+            f"🎁 جایزه: {campaign['prize'] or 'طبق اطلاع‌رسانی رسمی'}\n\n"
         )
 
-    await update.message.reply_text(
+    await query.edit_message_text(
         text,
         parse_mode=ParseMode.HTML,
+        reply_markup=campaign_keyboard(campaigns),
     )
 
 
-# ============================================================
-# DRAW
-# ============================================================
-
-async def draw(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "مثال:\n/draw 1"
-        )
-        return
+async def join_campaign(update, context):
+    query = update.callback_query
+    await query.answer()
 
     try:
-        campaign_id = int(
-            context.args[0]
-        )
-    except ValueError:
-        await update.message.reply_text(
-            "❌ ID مسابقه صحیح نیست."
+        campaign_id = int(query.data.split(":", 1)[1])
+    except Exception:
+        await query.edit_message_text(
+            "❌ شناسه مسابقه نامعتبر است.",
+            reply_markup=back_menu(),
         )
         return
 
-    # --------------------------------------------------------
-    # قرعه‌کشی تا زمان فعال شدن مرحله 100K قفل است
-    # --------------------------------------------------------
+    user = query.from_user
+    ensure_user(user)
 
-    await update_telegram_count(
-        context.bot
-    )
-
-    if not check_activation():
-        await update.message.reply_text(
-            "🔒 <b>قرعه‌کشی هنوز فعال نشده است.</b>\n\n"
-            "ثبت‌نام کاربران و ثبت‌نام مسابقات "
-            "می‌تواند انجام شود، اما اجرای قرعه‌کشی "
-            "تا تکمیل حد نصاب فعال‌سازی 100K قفل است.",
+    if not has_accepted_rules(user.id):
+        await query.edit_message_text(
+            RULES_TEXT
+            + "\n\n<b>قبل از ثبت‌نام مسابقه باید قوانین را بپذیری.</b>",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ پذیرش قوانین",
+                        callback_data=f"accept_rules_join:{campaign_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="campaigns",
+                    )
+                ],
+            ]),
         )
         return
 
-    connection = db()
-
-    campaign = connection.execute(
+    campaign = db_execute(
         """
         SELECT *
         FROM campaigns
-        WHERE id=?
+        WHERE id = ?
+          AND status = 'open'
         """,
         (campaign_id,),
-    ).fetchone()
-
-    if not campaign:
-        connection.close()
-
-        await update.message.reply_text(
-            "❌ مسابقه پیدا نشد."
-        )
-        return
-
-    if campaign["draw_completed"]:
-        connection.close()
-
-        await update.message.reply_text(
-            "❌ این مسابقه قبلاً قرعه‌کشی شده."
-        )
-        return
-
-    participants = connection.execute(
-        """
-        SELECT
-            p.telegram_id,
-            p.chance_count
-        FROM participations p
-        JOIN users u
-          ON u.telegram_id=p.telegram_id
-        WHERE p.campaign_id=?
-          AND u.registered=1
-          AND u.blocked=0
-        """,
-        (campaign_id,),
-    ).fetchall()
-
-    connection.close()
-
-    pool = []
-
-    for participant in participants:
-        try:
-            member_ok = await check_telegram_membership(
-                context.bot,
-                participant["telegram_id"]
-            )
-        except Exception:
-            member_ok = False
-
-        if not member_ok:
-            continue
-
-        count = max(
-            1,
-            int(
-                participant["chance_count"]
-            )
-        )
-
-        pool.extend(
-            [participant["telegram_id"]] * count
-        )
-
-    if not pool:
-        await update.message.reply_text(
-            "❌ شرکت‌کننده واجد شرایط پیدا نشد."
-        )
-        return
-
-    winner_id = random.choice(
-        pool
+        fetchone=True,
+        commit=False,
     )
 
-    connection = db()
+    if campaign is None:
+        await query.edit_message_text(
+            "❌ این مسابقه دیگر فعال نیست.",
+            reply_markup=back_menu(),
+        )
+        return
 
-    connection.execute(
+    existing = db_execute(
         """
-        INSERT INTO winners(
+        SELECT id
+        FROM participations
+        WHERE user_id = ?
+          AND campaign_id = ?
+        """,
+        (
+            user.id,
             campaign_id,
-            telegram_id,
-            prize,
+        ),
+        fetchone=True,
+        commit=False,
+    )
+
+    if existing:
+        await query.edit_message_text(
+            f"""
+✅ شما قبلاً در مسابقه <b>{campaign['title']}</b> ثبت‌نام کرده‌اید.
+
+🎯 شانس‌های حساب شما از بخش «شانس‌های من» قابل مشاهده است.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+        return
+
+    db_execute(
+        """
+        INSERT INTO participations(
+            user_id,
+            campaign_id,
+            chances,
             created_at
         )
         VALUES (?, ?, ?, ?)
         """,
         (
+            user.id,
             campaign_id,
-            winner_id,
-            campaign["prize"],
-            now(),
+            1,
+            now_iso(),
         ),
     )
 
-    connection.execute(
+    db_execute(
         """
-        UPDATE campaigns
-        SET
-            active=0,
-            draw_completed=1
-        WHERE id=?
+        UPDATE users
+        SET registered = 1,
+            registration_type = 'free',
+            chances = CASE
+                WHEN chances < 1 THEN 1
+                ELSE chances
+            END,
+            updated_at = ?
+        WHERE telegram_id = ?
         """,
-        (campaign_id,),
-    )
-
-    connection.commit()
-    connection.close()
-
-    await update.message.reply_text(
-        "🎉 <b>قرعه‌کشی انجام شد.</b>\n\n"
-        f"🎁 مسابقه: <b>{campaign['title']}</b>\n"
-        f"🏆 جایزه: <b>{campaign['prize']}</b>\n"
-        f"🆔 شناسه برنده: "
-        f"<code>{winner_id}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL,
-            text=(
-                "🎉 <b>نتیجه رسمی قرعه‌کشی محفل</b>\n\n"
-                f"🎁 {campaign['title']}\n"
-                f"🏆 جایزه: {campaign['prize']}\n\n"
-                f"🆔 شناسه برنده:\n"
-                f"<code>{winner_id}</code>\n\n"
-                "🔥 برای مسابقات بعدی همراه محفل باشید."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Winner announcement failed: %s",
-            exc
-        )
-
-
-# ============================================================
-# POST NOW
-# ============================================================
-
-async def postnow(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    try:
-        await context.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL,
-            text=promotional_text(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-        )
-
-        set_setting(
-            "last_auto_post",
-            now()
-        )
-
-        await update.message.reply_text(
-            "✅ تبلیغ با موفقیت ارسال شد."
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "postnow error: %s",
-            exc
-        )
-
-        await update.message.reply_text(
-            "❌ ارسال نشد.\n\n"
-            "بررسی کن ربات در کانال ادمین باشد "
-            "و اجازه ارسال پیام داشته باشد."
-        )
-
-
-# ============================================================
-# SUPPORT
-# ============================================================
-
-async def support_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    context.user_data["support_mode"] = True
-
-    await query.edit_message_text(
-        "🆘 <b>پشتیبانی محفل</b>\n\n"
-
-        "پیامت را همینجا به صورت یک پیام متنی بفرست.\n\n"
-
-        "📌 پیام تو به عنوان تیکت ثبت می‌شود و "
-        "برای مدیریت ارسال خواهد شد.\n\n"
-
-        "برای لغو، روی «لغو» بزن.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "❌ لغو",
-                    callback_data="support_cancel"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
-                )
-            ],
-        ]),
-    )
-
-
-async def support_cancel(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    context.user_data.pop(
-        "support_mode",
-        None
+        (
+            now_iso(),
+            user.id,
+        ),
     )
 
     await query.edit_message_text(
-        "🆘 ارسال پیام پشتیبانی لغو شد.",
+        f"""
+🎉 <b>ثبت‌نام مسابقه با موفقیت انجام شد.</b>
+
+🏆 مسابقه:
+<b>{campaign['title']}</b>
+
+🎯 شانس پایه: <b>۱</b>
+
+برای افزایش شانس، دوستانت را با لینک اختصاصی خودت دعوت کن.
+""",
+        parse_mode=ParseMode.HTML,
         reply_markup=main_menu(),
     )
 
 
-async def tickets_command(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    connection = db()
-
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM support_tickets
-        WHERE status='open'
-        ORDER BY id DESC
-        LIMIT 20
-        """
-    ).fetchall()
-
-    connection.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "📩 تیکت بازی وجود ندارد."
-        )
-        return
-
-    for row in rows:
-        await update.message.reply_text(
-            "🆘 <b>تیکت #{}</b>\n\n"
-            "🆔 User ID: <code>{}</code>\n"
-            "🕐 {}\n\n"
-            "{}\n\n"
-            "برای پاسخ:\n"
-            "<code>/replyticket {} متن پاسخ</code>".format(
-                row["id"],
-                row["telegram_id"],
-                row["created_at"],
-                row["message"],
-                row["id"],
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-
-
-async def replyticket(
-    update,
-    context
-):
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ دسترسی ندارید."
-        )
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "فرمت:\n"
-            "/replyticket ID متن پاسخ\n\n"
-            "مثال:\n"
-            "/replyticket 15 سلام، مشکل شما بررسی شد."
-        )
-        return
-
-    try:
-        ticket_id = int(
-            context.args[0]
-        )
-    except ValueError:
-        await update.message.reply_text(
-            "❌ ID تیکت صحیح نیست."
-        )
-        return
-
-    reply_text = " ".join(
-        context.args[1:]
-    ).strip()
-
-    connection = db()
-
-    ticket = connection.execute(
-        """
-        SELECT *
-        FROM support_tickets
-        WHERE id=?
-        """,
-        (ticket_id,),
-    ).fetchone()
-
-    if not ticket:
-        connection.close()
-
-        await update.message.reply_text(
-            "❌ تیکت پیدا نشد."
-        )
-        return
-
-    connection.execute(
-        """
-        UPDATE support_tickets
-        SET
-            admin_reply=?,
-            status='closed',
-            replied_at=?
-        WHERE id=?
-        """,
-        (
-            reply_text,
-            now(),
-            ticket_id,
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    try:
-        await context.bot.send_message(
-            chat_id=ticket["telegram_id"],
-            text=(
-                "🆘 <b>پاسخ پشتیبانی محفل</b>\n\n"
-                f"{reply_text}\n\n"
-                f"🎫 شماره تیکت: #{ticket_id}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-
-        await update.message.reply_text(
-            f"✅ پاسخ تیکت #{ticket_id} ارسال شد."
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "Support reply failed: %s",
-            exc
-        )
-
-        await update.message.reply_text(
-            "⚠️ پاسخ ذخیره شد اما ارسال به کاربر انجام نشد."
-        )
-
-
 # ============================================================
-# REGISTRATION / RULES CALLBACKS
+# RULES CALLBACKS
 # ============================================================
 
-async def rules_callback(
-    update,
-    context
-):
+async def show_rules(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    create_or_update_user(
-        query.from_user
-    )
-
     await query.edit_message_text(
-        rules_text(),
+        RULES_TEXT,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    "✅ قوانین را می‌پذیرم",
-                    callback_data="accept_rules"
+                    "✅ قبول قوانین",
+                    callback_data="accept_rules",
                 )
             ],
             [
                 InlineKeyboardButton(
                     "🔙 بازگشت",
-                    callback_data="home"
+                    callback_data="home",
                 )
             ],
         ]),
     )
 
 
-async def accept_rules_callback(
-    update,
-    context
-):
+async def accept_rules(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    create_or_update_user(
-        query.from_user
-    )
-
-    accept_rules(
-        query.from_user.id
-    )
+    save_rules_acceptance(query.from_user.id)
 
     await query.edit_message_text(
-        "✅ <b>قوانین با موفقیت پذیرفته شد.</b>\n\n"
-        "حالا نوع ثبت‌نامت را انتخاب کن.\n\n"
-        "🆓 ثبت‌نام رایگان فعال است.\n"
-        "💳 ثبت‌نام پولی فعلاً خاموش است.",
+        """
+✅ <b>قوانین با موفقیت پذیرفته شد.</b>
+
+حالا می‌توانی برای مسابقه ثبت‌نام کنی.
+""",
         parse_mode=ParseMode.HTML,
-        reply_markup=registration_keyboard(),
+        reply_markup=registration_menu(),
     )
 
 
-async def register_free_callback(
-    update,
-    context
-):
+async def accept_rules_register(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    create_or_update_user(
-        query.from_user
-    )
+    save_rules_acceptance(query.from_user.id)
 
-    success, reason = register_user(
-        query.from_user.id,
-        "free"
-    )
+    await register_free_user(update, context)
 
-    if not success:
-        if reason == "already_registered":
-            await query.edit_message_text(
-                "✅ <b>قبلاً ثبت‌نام کرده‌ای.</b>\n\n"
-                "از منوی اصلی ادامه بده.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu(),
-            )
-            return
 
-        await query.answer(
-            "ابتدا قوانین را بپذیر.",
-            show_alert=True
+async def accept_rules_join(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        campaign_id = int(
+            query.data.split(":", 1)[1]
         )
-
+    except Exception:
+        await query.edit_message_text(
+            "❌ خطا در مسابقه.",
+            reply_markup=back_menu(),
+        )
         return
 
-    user = get_user(
-        query.from_user.id
-    )
+    save_rules_acceptance(query.from_user.id)
+
+    # ثبت‌نام را مستقیم انجام بده
+    class FakeQuery:
+        pass
+
+    # همان منطق join را با تغییر callback اجرا نمی‌کنیم؛
+    # برای جلوگیری از پیچیدگی، کاربر را به لیست مسابقات برمی‌گردانیم.
+    campaigns = get_open_campaigns()
 
     await query.edit_message_text(
-        "🎉 <b>ثبت‌نام با موفقیت انجام شد!</b>\n\n"
+        """
+✅ قوانین پذیرفته شد.
 
-        "✅ نام شما وارد لیست محفل شد.\n"
-        f"🎟 شانس اولیه: <b>{user['chances']}</b>\n\n"
-
-        "👥 حالا لینک دعوت اختصاصی خودت را بفرست "
-        "تا دوستانت هم وارد محفل شوند.\n\n"
-
-        "📌 هر دعوت موفق، پس از ثبت‌نام کامل فرد دعوت‌شده، "
-        "طبق قوانین یک شانس اضافه برای تو ایجاد می‌کند.\n\n"
-
-        "🔥 مسابقات را هم از همین حالا می‌توانی ببینی.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu(),
-    )
-
-
-async def paid_disabled_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer(
-        "💳 ثبت‌نام پولی فعلاً فعال نیست.",
-        show_alert=True
-    )
-
-
-async def guide_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-        "📘 <b>راهنمای محفل</b>\n\n"
-
-        "1️⃣ قوانین را بخوان و قبول کن.\n"
-        "2️⃣ ثبت‌نام رایگان را انجام بده.\n"
-        "3️⃣ وارد لیست کاربران محفل می‌شوی.\n"
-        "4️⃣ لینک دعوت اختصاصی‌ات را برای دوستان بفرست.\n"
-        "5️⃣ با هر دعوت موفق، شانس اضافه دریافت کن.\n"
-        "6️⃣ اینستاگرام، یوتیوب و تلگرام محفل را دنبال کن.\n"
-        "7️⃣ مسابقات فعال را ببین و در مسابقه موردنظر ثبت‌نام کن.\n"
-        "8️⃣ حد نصاب شبکه‌ها مسیر فعال شدن قرعه‌کشی را مشخص می‌کند.\n"
-        "9️⃣ هنگام قرعه‌کشی شرایط لازم دوباره بررسی می‌شود.\n\n"
-
-        "💡 ثبت‌نام کاربر با فعال‌سازی 100K دو مرحله جدا هستند.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🆓 ثبت‌نام",
-                    callback_data="rules"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
-                )
-            ],
-        ]),
+حالا مسابقه موردنظر را انتخاب کن:
+""",
+        reply_markup=campaign_keyboard(campaigns),
     )
 
 
 # ============================================================
-# USER INFO
+# MY CHANCES
 # ============================================================
 
-async def my_registration_callback(
-    update,
-    context
-):
+async def show_my_chances(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    user = get_user(
-        query.from_user.id
-    )
+    user = get_user(query.from_user.id)
 
     if not user:
-        create_or_update_user(
-            query.from_user
-        )
-        user = get_user(
-            query.from_user.id
-        )
+        user = ensure_user(query.from_user)
 
-    if user["registered"]:
-        registration_type = (
-            "رایگان"
-            if user["registration_type"] == "free"
-            else user["registration_type"]
-        )
+    referrals = db_execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM referrals
+        WHERE referrer_id = ?
+          AND successful = 1
+        """,
+        (query.from_user.id,),
+        fetchone=True,
+        commit=False,
+    )
 
-        text = (
-            "📋 <b>وضعیت ثبت‌نام</b>\n\n"
-            "✅ ثبت‌نام: انجام شده\n"
-            f"نوع: <b>{registration_type}</b>\n"
-            f"🎟 شانس: <b>{user['chances']}</b>\n"
-            f"👥 دعوت موفق: <b>{user['referral_count']}</b>"
-        )
-
-    else:
-        text = (
-            "📋 <b>وضعیت ثبت‌نام</b>\n\n"
-            "❌ هنوز ثبت‌نام کامل نشده است.\n\n"
-            "برای ثبت‌نام رایگان از گزینه زیر استفاده کن."
-        )
+    participations = db_execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM participations
+        WHERE user_id = ?
+        """,
+        (query.from_user.id,),
+        fetchone=True,
+        commit=False,
+    )
 
     await query.edit_message_text(
-        text,
+        f"""
+<b>🎯 شانس‌های من</b>
+
+شانس کل حساب:
+<b>{user['chances']}</b>
+
+👥 معرفی موفق:
+<b>{referrals['total']}</b>
+
+🏆 تعداد مسابقات ثبت‌نام‌شده:
+<b>{participations['total']}</b>
+
+هر معرفی موفق یک شانس اضافه ایجاد می‌کند.
+""",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🆓 ثبت‌نام / ادامه",
-                    callback_data="rules"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
-                )
-            ],
-        ]),
+        reply_markup=back_menu(),
     )
 
 
@@ -2414,100 +1332,59 @@ async def my_registration_callback(
 # REFERRAL
 # ============================================================
 
-async def referral_callback(
-    update,
-    context
-):
+async def show_referral(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    user = get_user(
-        query.from_user.id
-    )
+    link = referral_link(query.from_user.id)
 
-    if not user:
-        create_or_update_user(
-            query.from_user
-        )
-        user = get_user(
-            query.from_user.id
-        )
-
-    link = (
-        f"https://t.me/"
-        f"{BOT_USERNAME}"
-        f"?start={query.from_user.id}"
+    referrals = db_execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM referrals
+        WHERE referrer_id = ?
+          AND successful = 1
+        """,
+        (query.from_user.id,),
+        fetchone=True,
+        commit=False,
     )
 
     await query.edit_message_text(
-        "👥 <b>دعوت دوستان</b>\n\n"
+        f"""
+<b>👥 دعوت دوستان</b>
 
-        f"🎟 شانس فعلی: <b>{user['chances']}</b>\n"
-        f"🤝 دعوت موفق: <b>{user['referral_count']}</b>\n\n"
+با لینک اختصاصی خودت دوستانت را دعوت کن.
 
-        "🔗 لینک اختصاصی تو:\n"
-        f"<code>{link}</code>\n\n"
+هر فردی که از لینک تو وارد شود و ثبت‌نام موفق انجام دهد:
 
-        "📌 نکته مهم:\n"
-        "فقط وقتی دعوت موفق محسوب می‌شود که فرد از "
-        "لینک تو وارد شود و ثبت‌نام خودش را کامل کند.\n\n"
+🎯 <b>۱ شانس اضافه برای تو</b>
 
-        "🔥 لینک را برای دوستانت بفرست!",
+تعداد دعوت‌های موفق:
+<b>{referrals['total']}</b>
+
+<b>لینک اختصاصی شما:</b>
+<code>{link}</code>
+
+لینک را برای دوستانت بفرست.
+""",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
-                )
-            ]
-        ]),
-    )
-
-
-# ============================================================
-# CHANCES
-# ============================================================
-
-async def chances_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    user = get_user(
-        query.from_user.id
-    )
-
-    if not user:
-        create_or_update_user(
-            query.from_user
-        )
-        user = get_user(
-            query.from_user.id
-        )
-
-    await query.edit_message_text(
-        "🎟 <b>شانس‌های من</b>\n\n"
-        f"🎟 شانس فعلی: <b>{user['chances']}</b>\n"
-        f"👥 دعوت موفق: <b>{user['referral_count']}</b>\n\n"
-        "هر شانس طبق قوانین مسابقه می‌تواند "
-        "در محاسبه شانس‌های همان مسابقه استفاده شود.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "👥 دعوت دوستان",
-                    callback_data="referral"
+                    "📤 اشتراک لینک",
+                    url=(
+                        "https://t.me/share/url?"
+                        f"url={quote(link)}"
+                        "&text="
+                        f"{quote('برای شرکت در محفل خوش‌شانس‌ها وارد شو و ثبت‌نام کن 🎉')}"
+                    ),
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
+                    "🔙 بازگشت",
+                    callback_data="home",
                 )
             ],
         ]),
@@ -2518,1102 +1395,1547 @@ async def chances_callback(
 # ELIGIBILITY
 # ============================================================
 
-async def eligibility_callback(
-    update,
-    context
-):
+async def show_eligibility(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    telegram_ok = await check_telegram_membership(
+    user = ensure_user(query.from_user)
+
+    tg_member = await refresh_user_membership(
         context.bot,
-        query.from_user.id
+        query.from_user.id,
     )
 
+    rules = has_accepted_rules(query.from_user.id)
+
     await query.edit_message_text(
-        "🔎 <b>بررسی شرایط فعلی</b>\n\n"
+        f"""
+<b>✅ شرایط فعلی شما</b>
 
-        f"📢 عضویت تلگرام: "
-        f"<b>{'✅ تأیید شده' if telegram_ok else '❌ تأیید نشده'}</b>\n\n"
+📜 قوانین:
+{'✅ پذیرفته شده' if rules else '❌ هنوز پذیرفته نشده'}
 
-        "📸 Instagram: "
-        "در حال حاضر احراز خودکار فعال نیست.\n"
+📢 عضویت تلگرام:
+{'✅ تأیید شد' if tg_member else '❌ تأیید نشد'}
 
-        "▶️ YouTube: "
-        "در حال حاضر احراز خودکار فعال نیست.\n\n"
+📸 اینستاگرام:
+{'✅ اعلام شده' if user['instagram_follow'] else '⏳ هنوز ثبت نشده'}
 
-        "⚠️ در صورت فعال شدن احراز شبکه‌های اجتماعی، "
-        "شرایط آن در قوانین و مسابقه مربوطه اعلام خواهد شد.",
+▶️ یوتیوب:
+{'✅ اعلام شده' if user['youtube_follow'] else '⏳ هنوز ثبت نشده'}
+
+🏆 وضعیت شبکه:
+{'🟢 فعال' if network_activated() else '🟡 هنوز فعال نشده'}
+
+⚠️ تأیید خودکار اینستاگرام و یوتیوب فعلاً فعال نیست.
+""",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    "📢 عضویت تلگرام",
-                    url=(
-                        "https://t.me/"
-                        f"{TELEGRAM_CHANNEL.lstrip('@')}"
-                    )
+                    "📸 باز کردن اینستاگرام",
+                    url=INSTAGRAM_URL,
+                ),
+                InlineKeyboardButton(
+                    "▶️ باز کردن یوتیوب",
+                    url=YOUTUBE_URL,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📢 عضویت کانال",
+                    url=f"https://t.me/{TELEGRAM_CHANNEL.lstrip('@')}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "🔄 بررسی دوباره",
-                    callback_data="eligibility"
+                    "🔄 بررسی عضویت تلگرام",
+                    callback_data="check_tg",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
+                    "🔙 بازگشت",
+                    callback_data="home",
                 )
             ],
         ]),
     )
 
 
-# ============================================================
-# CAMPAIGNS CALLBACK
-# ============================================================
-
-async def campaigns_callback(
-    update,
-    context
-):
+async def check_tg(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    connection = db()
-
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE active=1
-          AND draw_completed=0
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    connection.close()
-
-    if not rows:
-        await query.edit_message_text(
-            "🎁 <b>مسابقه فعال فعلاً وجود ندارد.</b>\n\n"
-            "🔥 محفل در حال آماده‌سازی مسابقات است.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📈 وضعیت 100K",
-                        callback_data="network"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 منوی اصلی",
-                        callback_data="home"
-                    )
-                ],
-            ]),
-        )
-        return
-
-    buttons = []
-
-    for row in rows:
-        buttons.append([
-            InlineKeyboardButton(
-                f"🎁 {row['title']}",
-                callback_data=f"campaign:{row['id']}"
-            )
-        ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "🏠 منوی اصلی",
-            callback_data="home"
-        )
-    ])
-
-    await query.edit_message_text(
-        "🎁 <b>مسابقات فعال</b>\n\n"
-        "مسابقه موردنظر را انتخاب کن:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-async def campaign_details(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    try:
-        campaign_id = int(
-            query.data.split(":")[1]
-        )
-    except Exception:
-        return
-
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-        """,
-        (campaign_id,),
-    ).fetchone()
-
-    connection.close()
-
-    if not row:
-        await query.edit_message_text(
-            "❌ مسابقه پیدا نشد."
-        )
-        return
-
-    await query.edit_message_text(
-        f"🎁 <b>{row['title']}</b>\n\n"
-        f"{row['description']}\n\n"
-        f"🏆 جایزه: <b>{row['prize']}</b>\n\n"
-
-        "📌 ثبت‌نام مسابقه از فعال‌سازی 100K جداست.\n"
-        "🎲 اجرای قرعه‌کشی پس از تکمیل شرایط فعال‌سازی "
-        "و سایر شرایط مسابقه انجام می‌شود.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🎟 ثبت‌نام در مسابقه",
-                    callback_data=f"join:{campaign_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔙 مسابقات",
-                    callback_data="campaigns"
-                )
-            ],
-        ]),
-    )
-
-
-# ============================================================
-# JOIN CAMPAIGN
-# ============================================================
-
-async def join_campaign(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    user = get_user(
-        query.from_user.id
-    )
-
-    if not user or not user["registered"]:
-        await query.answer(
-            "ابتدا ثبت‌نام رایگان را کامل کن.",
-            show_alert=True
-        )
-
-        await query.edit_message_text(
-            "❌ <b>هنوز ثبت‌نام نکرده‌ای.</b>\n\n"
-            "ثبت‌نام مسابقه فقط برای کاربران ثبت‌نام‌شده "
-            "انجام می‌شود.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🆓 ثبت‌نام رایگان",
-                        callback_data="rules"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🏠 منوی اصلی",
-                        callback_data="home"
-                    )
-                ],
-            ]),
-        )
-
-        return
-
-    try:
-        campaign_id = int(
-            query.data.split(":")[1]
-        )
-    except Exception:
-        await query.answer(
-            "شناسه مسابقه نامعتبر است.",
-            show_alert=True
-        )
-        return
-
-    telegram_ok = await check_telegram_membership(
+    member = await refresh_user_membership(
         context.bot,
-        query.from_user.id
+        query.from_user.id,
     )
 
-    if not telegram_ok:
-        await query.answer(
-            "ابتدا عضو کانال تلگرام شوید.",
-            show_alert=True
-        )
+    if member:
+        text = """
+✅ عضویت شما در کانال تلگرام تأیید شد.
+"""
+    else:
+        text = """
+❌ هنوز عضویت شما در کانال تلگرام تأیید نشده است.
 
-        await query.edit_message_text(
-            "❌ <b>عضویت تلگرام تأیید نشد.</b>\n\n"
-            "ابتدا عضو کانال شو و دوباره امتحان کن.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "📢 عضویت در کانال",
-                        url=(
-                            "https://t.me/"
-                            f"{TELEGRAM_CHANNEL.lstrip('@')}"
-                        )
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔄 تلاش دوباره",
-                        callback_data=f"join:{campaign_id}"
-                    )
-                ]
-            ]),
-        )
-
-        return
-
-    connection = db()
-
-    campaign = connection.execute(
-        """
-        SELECT *
-        FROM campaigns
-        WHERE id=?
-          AND active=1
-          AND draw_completed=0
-        """,
-        (campaign_id,),
-    ).fetchone()
-
-    if not campaign:
-        connection.close()
-
-        await query.answer(
-            "این مسابقه فعال نیست.",
-            show_alert=True
-        )
-        return
-
-    existing = connection.execute(
-        """
-        SELECT id
-        FROM participations
-        WHERE campaign_id=?
-          AND telegram_id=?
-        """,
-        (
-            campaign_id,
-            query.from_user.id,
-        ),
-    ).fetchone()
-
-    if existing:
-        connection.close()
-
-        await query.answer(
-            "قبلاً در این مسابقه ثبت‌نام کرده‌ای.",
-            show_alert=True
-        )
-        return
-
-    chance_count = max(
-        1,
-        int(user["chances"])
-    )
-
-    connection.execute(
-        """
-        INSERT INTO participations(
-            campaign_id,
-            telegram_id,
-            chance_count,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            campaign_id,
-            query.from_user.id,
-            chance_count,
-            now(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    await query.answer(
-        "ثبت‌نام مسابقه انجام شد 🎉",
-        show_alert=True
-    )
+ابتدا عضو کانال شوید و دوباره بررسی کنید.
+"""
 
     await query.edit_message_text(
-        "🎉 <b>ثبت‌نام مسابقه موفق بود!</b>\n\n"
-        f"🎁 {campaign['title']}\n"
-        f"🏆 جایزه: {campaign['prize']}\n"
-        f"🎟 شانس ثبت‌شده: <b>{chance_count}</b>\n\n"
-        "⚠️ شرایط لازم هنگام قرعه‌کشی دوباره بررسی می‌شود.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "👥 دعوت دوستان",
-                    callback_data="referral"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
-                )
-            ],
-        ]),
+        text,
+        reply_markup=back_menu(),
     )
 
 
 # ============================================================
-# NETWORK CALLBACK
+# SUPPORT
 # ============================================================
 
-async def network_callback(
-    update,
-    context
-):
+async def show_support(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    await update_telegram_count(
-        context.bot
-    )
+    support_text = """
+<b>🎧 پشتیبانی محفل خوش‌شانس‌ها</b>
+
+اگر سؤال، مشکل ثبت‌نام، مشکل شانس، مشکل مسابقه یا موضوع دیگری داری، از گزینه زیر پیام خودت را برای پشتیبانی ارسال کن.
+
+پشتیبانی واقعی است و پیام شما مستقیماً برای مدیریت ارسال می‌شود.
+"""
+
+    if SUPPORT_USERNAME:
+        support_text += (
+            f"\n\n🆔 پشتیبانی مستقیم: @{SUPPORT_USERNAME}"
+        )
 
     await query.edit_message_text(
-        activation_text(),
+        support_text,
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔄 بروزرسانی",
-                    callback_data="network"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏠 منوی اصلی",
-                    callback_data="home"
-                )
-            ],
-        ]),
+        reply_markup=support_menu(),
     )
 
 
-# ============================================================
-# HOME
-# ============================================================
-
-async def home_callback(
-    update,
-    context
-):
+async def start_support_ticket(update, context):
     query = update.callback_query
-
     await query.answer()
 
-    context.user_data.pop(
-        "support_mode",
-        None
-    )
+    context.user_data["support_waiting"] = True
 
     await query.edit_message_text(
-        "🏠 <b>محفل خوش‌شانس‌ها</b>\n\n"
-        "از منوی زیر انتخاب کن:",
+        """
+✉️ <b>پیام خود را بنویس</b>
+
+هر مشکلی داری همینجا بنویس.
+پیام مستقیماً برای پشتیبانی ارسال می‌شود.
+
+برای لغو، /cancel را بزن.
+""",
         parse_mode=ParseMode.HTML,
+    )
+
+
+async def cancel_command(update, context):
+    context.user_data.pop("support_waiting", None)
+    context.user_data.pop("admin_reply_to", None)
+
+    await update.message.reply_text(
+        "لغو شد.",
         reply_markup=main_menu(),
     )
 
 
-# ============================================================
-# ADMIN CALLBACKS
-# ============================================================
+async def send_support_ticket(update, context):
+    if not update.message:
+        return
 
-async def admin_callback(
-    update,
-    context
-):
-    query = update.callback_query
+    if not context.user_data.get("support_waiting"):
+        return
 
-    await query.answer()
+    if is_admin(update.effective_user.id):
+        return
 
-    if not is_admin(
-        query.from_user.id
-    ):
-        await query.answer(
-            "دسترسی ندارید.",
-            show_alert=True
+    user = update.effective_user
+    ensure_user(user)
+
+    message_text = update.message.text or ""
+
+    if not message_text.strip():
+        await update.message.reply_text(
+            "لطفاً پیام پشتیبانی را به صورت متن ارسال کن."
         )
         return
 
-    await query.edit_message_text(
-        "🛠 <b>پنل مدیریت</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_menu(),
+    ticket_id = db_execute(
+        """
+        INSERT INTO support_tickets(
+            user_telegram_id,
+            message,
+            status,
+            created_at
+        )
+        VALUES (?, ?, 'open', ?)
+        """,
+        (
+            user.id,
+            message_text,
+            now_iso(),
+        ),
     )
 
+    context.user_data["support_waiting"] = False
 
-async def admin_status_callback(
-    update,
-    context
-):
-    query = update.callback_query
+    sent = 0
 
-    await query.answer()
+    for admin_id in ADMIN_IDS:
+        try:
+            admin_text = (
+                "🎧 <b>پیام جدید پشتیبانی</b>\n\n"
+                f"🎫 تیکت: <code>#{ticket_id}</code>\n"
+                f"👤 نام: {user.first_name or '-'}\n"
+                f"🆔 Telegram ID: <code>{user.id}</code>\n"
+                f"👤 Username: @{user.username if user.username else '-'}\n\n"
+                f"💬 پیام:\n{message_text}"
+            )
 
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "↩️ پاسخ به کاربر",
+                        callback_data=f"reply_ticket:{ticket_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ بستن تیکت",
+                        callback_data=f"close_ticket:{ticket_id}",
+                    )
+                ],
+            ])
 
-    await update_telegram_count(
-        context.bot
-    )
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=admin_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
 
-    connection = db()
+            sent += 1
 
-    users = connection.execute(
-        "SELECT COUNT(*) c FROM users"
-    ).fetchone()["c"]
+        except Exception as exc:
+            logger.exception(
+                "Could not send support ticket to admin: %s",
+                exc,
+            )
 
-    registered = connection.execute(
-        """
-        SELECT COUNT(*) c
-        FROM users
-        WHERE registered=1
-        """
-    ).fetchone()["c"]
+    if sent:
+        await update.message.reply_text(
+            f"""
+✅ پیام شما ثبت شد.
 
-    tickets = connection.execute(
-        """
-        SELECT COUNT(*) c
-        FROM support_tickets
-        WHERE status='open'
-        """
-    ).fetchone()["c"]
+🎫 شماره تیکت:
+<code>#{ticket_id}</code>
 
-    connection.close()
-
-    networks = get_networks()
-
-    await query.edit_message_text(
-        "📊 <b>وضعیت سیستم</b>\n\n"
-        f"👥 کاربران: <b>{fmt_number(users)}</b>\n"
-        f"✅ ثبت‌نام‌شده: <b>{fmt_number(registered)}</b>\n"
-        f"🆘 تیکت باز: <b>{fmt_number(tickets)}</b>\n\n"
-
-        f"📸 IG: <b>{fmt_number(networks['instagram'])}</b>\n"
-        f"▶️ YT: <b>{fmt_number(networks['youtube'])}</b>\n"
-        f"📢 TG: <b>{fmt_number(networks['telegram'])}</b>\n\n"
-
-        f"🚀 فعال‌سازی: "
-        f"<b>{'فعال' if check_activation() else 'در انتظار'}</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
-    )
-
-
-async def admin_users_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    connection = db()
-
-    total = connection.execute(
-        "SELECT COUNT(*) c FROM users"
-    ).fetchone()["c"]
-
-    registered = connection.execute(
-        """
-        SELECT COUNT(*) c
-        FROM users
-        WHERE registered=1
-        """
-    ).fetchone()["c"]
-
-    referrals = connection.execute(
-        "SELECT COUNT(*) c FROM referrals"
-    ).fetchone()["c"]
-
-    connection.close()
-
-    await query.edit_message_text(
-        "👥 <b>کاربران</b>\n\n"
-        f"کل: <b>{fmt_number(total)}</b>\n"
-        f"ثبت‌نام کامل: <b>{fmt_number(registered)}</b>\n"
-        f"دعوت موفق: <b>{fmt_number(referrals)}</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
-    )
-
-
-async def admin_networks_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    await update_telegram_count(
-        context.bot
-    )
-
-    await query.edit_message_text(
-        activation_text(),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
-    )
-
-
-async def admin_youtube_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    count = fetch_youtube_followers()
-
-    if count is None:
-        text = (
-            "❌ YouTube دریافت نشد.\n\n"
-            "API Key و Channel ID را بررسی کن."
+پیام برای مدیریت ارسال شد.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
         )
     else:
-        set_setting(
-            "youtube_followers",
-            count
+        await update.message.reply_text(
+            """
+⚠️ پیام ثبت شد، اما در حال حاضر پشتیبانی آنلاین در دسترس نیست.
+مدیریت پس از اتصال بررسی خواهد کرد.
+""",
+            reply_markup=main_menu(),
         )
 
-        text = (
-            "▶️ <b>YouTube بروزرسانی شد.</b>\n\n"
-            f"مشترکان: <b>{fmt_number(count)}</b>\n"
-            f"هدف: <b>{fmt_number(ACTIVATION_TARGET)}</b>"
-        )
 
-    await query.edit_message_text(
-        text,
+async def admin_reply_button(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    try:
+        ticket_id = int(
+            query.data.split(":", 1)[1]
+        )
+    except Exception:
+        await query.edit_message_text(
+            "❌ شماره تیکت نامعتبر است."
+        )
+        return
+
+    ticket = db_execute(
+        """
+        SELECT *
+        FROM support_tickets
+        WHERE id = ?
+        """,
+        (ticket_id,),
+        fetchone=True,
+        commit=False,
+    )
+
+    if not ticket:
+        await query.edit_message_text(
+            "❌ تیکت پیدا نشد."
+        )
+        return
+
+    context.user_data["admin_reply_to"] = ticket_id
+
+    await query.message.reply_text(
+        f"""
+↩️ <b>پاسخ به تیکت #{ticket_id}</b>
+
+پیام خودت را ارسال کن.
+پیام مستقیماً برای کاربر ارسال می‌شود.
+
+برای لغو:
+ /cancel
+""",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
     )
 
 
-async def admin_post_callback(
-    update,
-    context
-):
-    query = update.callback_query
+async def send_admin_reply(update, context):
+    if not is_admin(update.effective_user.id):
+        return
 
-    await query.answer()
+    ticket_id = context.user_data.get("admin_reply_to")
 
-    if not is_admin(
-        query.from_user.id
-    ):
+    if not ticket_id:
+        return
+
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+
+    if not text.strip():
+        return
+
+    ticket = db_execute(
+        """
+        SELECT *
+        FROM support_tickets
+        WHERE id = ?
+        """,
+        (ticket_id,),
+        fetchone=True,
+        commit=False,
+    )
+
+    if not ticket:
+        context.user_data.pop("admin_reply_to", None)
+
+        await update.message.reply_text(
+            "❌ تیکت پیدا نشد."
+        )
         return
 
     try:
         await context.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL,
-            text=promotional_text(),
+            chat_id=ticket["user_telegram_id"],
+            text=(
+                "🎧 <b>پاسخ پشتیبانی محفل</b>\n\n"
+                f"{text}"
+            ),
             parse_mode=ParseMode.HTML,
         )
 
-        text = "✅ تبلیغ ارسال شد."
-
-    except Exception:
-        text = (
-            "❌ ارسال نشد.\n\n"
-            "ربات باید در کانال ادمین باشد."
+        db_execute(
+            """
+            UPDATE support_tickets
+            SET status = 'answered',
+                admin_telegram_id = ?,
+                answered_at = ?
+            WHERE id = ?
+            """,
+            (
+                update.effective_user.id,
+                now_iso(),
+                ticket_id,
+            ),
         )
 
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
+        context.user_data.pop("admin_reply_to", None)
+
+        await update.message.reply_text(
+            f"✅ پاسخ تیکت #{ticket_id} برای کاربر ارسال شد."
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Admin reply failed: %s",
+            exc,
+        )
+
+        await update.message.reply_text(
+            "❌ ارسال پاسخ انجام نشد. احتمالاً کاربر ربات را مسدود کرده است."
+        )
+
+
+async def close_ticket(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    try:
+        ticket_id = int(
+            query.data.split(":", 1)[1]
+        )
+    except Exception:
+        return
+
+    db_execute(
+        """
+        UPDATE support_tickets
+        SET status = 'closed',
+            admin_telegram_id = ?
+        WHERE id = ?
+        """,
+        (
+            query.from_user.id,
+            ticket_id,
+        ),
+    )
+
+    await query.edit_message_reply_markup(
+        reply_markup=None,
+    )
+
+    await query.message.reply_text(
+        f"✅ تیکت #{ticket_id} بسته شد."
     )
 
 
-async def admin_campaigns_callback(
-    update,
-    context
-):
-    query = update.callback_query
+# ============================================================
+# ADMIN
+# ============================================================
 
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
+async def admin_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "⛔ دسترسی مجاز نیست."
+        )
         return
 
-    connection = db()
+    await update.message.reply_text(
+        """
+<b>🛠 پنل مدیریت محفل</b>
 
-    rows = connection.execute(
+دستورات مهم:
+
+/status
+/users
+/igfollowers 100000
+/ytfollowers 100000
+/tgfollowers 100000
+/createcampaign عنوان | توضیحات | جایزه
+/campaigns
+/draw ID
+/postnow
+/tickets
+/broadcast متن
+/activate
+/deactivate
+/myid
+
+برای پاسخ به پشتیبانی، روی دکمه «پاسخ به کاربر» بزن.
+""",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def myid_command(update, context):
+    await update.message.reply_text(
+        f"Telegram ID شما:\n<code>{update.effective_user.id}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def status_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    counts = get_counts()
+    users = db_execute(
+        "SELECT COUNT(*) AS total FROM users",
+        fetchone=True,
+        commit=False,
+    )
+
+    registered = db_execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE registered = 1
+        """,
+        fetchone=True,
+        commit=False,
+    )
+
+    tickets = db_execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM support_tickets
+        WHERE status = 'open'
+        """,
+        fetchone=True,
+        commit=False,
+    )
+
+    await update.message.reply_text(
+        f"""
+<b>📊 وضعیت سیستم</b>
+
+👤 کل کاربران:
+<b>{users['total']:,}</b>
+
+🎟 ثبت‌نام‌شده:
+<b>{registered['total']:,}</b>
+
+🎧 تیکت باز:
+<b>{tickets['total']:,}</b>
+
+📸 Instagram:
+<b>{counts['instagram']:,}</b>
+
+▶️ YouTube:
+<b>{counts['youtube']:,}</b>
+
+📢 Telegram:
+<b>{counts['telegram']:,}</b>
+
+🎯 هدف:
+<b>{ACTIVATION_TARGET:,}</b>
+
+🌐 فعال‌سازی:
+{'🟢 فعال' if network_activated() else '🟡 غیرفعال'}
+
+🆓 ثبت‌نام رایگان:
+🟢 فعال
+
+💳 ثبت‌نام پولی:
+🔴 خاموش
+""",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def users_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    row = db_execute(
+        "SELECT COUNT(*) AS total FROM users",
+        fetchone=True,
+        commit=False,
+    )
+
+    registered = db_execute(
+        """
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE registered = 1
+        """,
+        fetchone=True,
+        commit=False,
+    )
+
+    await update.message.reply_text(
+        f"""
+👥 کاربران
+
+کل کاربران: {row['total']:,}
+ثبت‌نام‌شده: {registered['total']:,}
+""",
+    )
+
+
+async def set_followers(update, context, key, label):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            f"مثال:\n/{label.lower()} 100000"
+        )
+        return
+
+    try:
+        value = int(
+            context.args[0].replace(",", "")
+        )
+
+        if value < 0:
+            raise ValueError
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ عدد معتبر وارد کن."
+        )
+        return
+
+    set_setting(key, value)
+
+    active = update_activation_status()
+
+    await update.message.reply_text(
+        f"""
+✅ شمارش {label} روی {value:,} ثبت شد.
+
+وضعیت فعال‌سازی:
+{'🟢 فعال' if active else '🟡 هنوز فعال نشده'}
+"""
+    )
+
+
+async def igfollowers_command(update, context):
+    await set_followers(
+        update,
+        context,
+        "instagram_followers",
+        "Instagram",
+    )
+
+
+async def ytfollowers_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    # اگر عدد دستی داده شد، دستی ثبت کن
+    if context.args:
+        await set_followers(
+            update,
+            context,
+            "youtube_followers",
+            "YouTube",
+        )
+        return
+
+    if not YOUTUBE_API_KEY or not YOUTUBE_CHANNEL_ID:
+        await update.message.reply_text(
+            """
+⚠️ برای شمارش خودکار یوتیوب، این دو Environment Variable را در Render قرار بده:
+
+YOUTUBE_API_KEY
+YOUTUBE_CHANNEL_ID
+
+یا عدد را دستی بده:
+
+/ytfollowers 100000
+"""
+        )
+        return
+
+    try:
+        value = await asyncio.to_thread(
+            fetch_youtube_subscribers
+        )
+
+        set_setting(
+            "youtube_followers",
+            value,
+        )
+
+        active = update_activation_status()
+
+        await update.message.reply_text(
+            f"""
+✅ تعداد مشترکین یوتیوب از API خوانده شد:
+
+<b>{value:,}</b>
+
+وضعیت فعال‌سازی:
+{'🟢 فعال' if active else '🟡 هنوز فعال نشده'}
+""",
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "YouTube update failed: %s",
+            exc,
+        )
+
+        await update.message.reply_text(
+            f"❌ دریافت تعداد یوتیوب انجام نشد:\n{exc}"
+        )
+
+
+async def tgfollowers_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if context.args:
+        await set_followers(
+            update,
+            context,
+            "telegram_followers",
+            "Telegram",
+        )
+        return
+
+    try:
+        chat = await context.bot.get_chat(
+            TELEGRAM_CHANNEL
+        )
+
+        count = await context.bot.get_chat_member_count(
+            chat.id
+        )
+
+        set_setting(
+            "telegram_followers",
+            count,
+        )
+
+        active = update_activation_status()
+
+        await update.message.reply_text(
+            f"""
+📢 تعداد اعضای تلگرام:
+
+<b>{count:,}</b>
+
+وضعیت فعال‌سازی:
+{'🟢 فعال' if active else '🟡 هنوز فعال نشده'}
+""",
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Telegram count failed: %s",
+            exc,
+        )
+
+        await update.message.reply_text(
+            f"""
+❌ شمارش تلگرام انجام نشد.
+
+مطمئن شو ربات در کانال دسترسی لازم را دارد.
+
+خطا:
+{exc}
+"""
+        )
+
+
+async def activate_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    set_setting(
+        "network_activated",
+        "1",
+    )
+
+    await update.message.reply_text(
+        """
+🟢 فعال‌سازی شبکه به صورت دستی روشن شد.
+
+توجه:
+این گزینه فقط برای مدیریت و تست است.
+"""
+    )
+
+
+async def deactivate_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    set_setting(
+        "network_activated",
+        "0",
+    )
+
+    await update.message.reply_text(
+        "🟡 فعال‌سازی شبکه خاموش شد."
+    )
+
+
+# ============================================================
+# CAMPAIGN ADMIN
+# ============================================================
+
+async def create_campaign_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    raw = update.message.text[
+        len("/createcampaign"):
+    ].strip()
+
+    parts = [
+        x.strip()
+        for x in raw.split("|")
+    ]
+
+    if len(parts) < 3:
+        await update.message.reply_text(
+            """
+فرمت صحیح:
+
+/createcampaign عنوان | توضیحات | جایزه
+"""
+        )
+        return
+
+    title, description, prize = parts[:3]
+
+    campaign_id = db_execute(
+        """
+        INSERT INTO campaigns(
+            title,
+            description,
+            prize,
+            status,
+            draw_allowed,
+            created_at
+        )
+        VALUES (?, ?, ?, 'open', ?, ?)
+        """,
+        (
+            title,
+            description,
+            prize,
+            1 if network_activated() else 0,
+            now_iso(),
+        ),
+    )
+
+    await update.message.reply_text(
+        f"""
+✅ مسابقه ساخته شد.
+
+شناسه:
+<b>{campaign_id}</b>
+
+عنوان:
+<b>{title}</b>
+
+وضعیت قرعه:
+{'🟢 مجاز' if network_activated() else '🟡 تا فعال شدن شبکه بسته'}
+""",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def campaigns_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    campaigns = db_execute(
         """
         SELECT *
         FROM campaigns
         ORDER BY id DESC
-        LIMIT 20
-        """
-    ).fetchall()
-
-    connection.close()
-
-    if not rows:
-        text = "🎁 مسابقه‌ای وجود ندارد."
-
-    else:
-        text = "🎁 <b>مسابقات</b>\n\n"
-
-        for row in rows:
-            status_text = (
-                "🟢 فعال"
-                if row["active"]
-                and not row["draw_completed"]
-                else "🔴 پایان"
-            )
-
-            text += (
-                f"#{row['id']} — "
-                f"<b>{row['title']}</b>\n"
-                f"🏆 {row['prize']}\n"
-                f"{status_text}\n\n"
-            )
-
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
+        """,
+        fetchall=True,
+        commit=False,
     )
 
-
-async def admin_support_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    connection = db()
-
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM support_tickets
-        WHERE status='open'
-        ORDER BY id DESC
-        LIMIT 10
-        """
-    ).fetchall()
-
-    connection.close()
-
-    if not rows:
-        text = (
-            "📩 <b>پشتیبانی</b>\n\n"
-            "تیکت بازی وجود ندارد."
-        )
-
-    else:
-        text = "📩 <b>تیکت‌های باز</b>\n\n"
-
-        for row in rows:
-            text += (
-                f"🎫 #{row['id']}\n"
-                f"👤 <code>{row['telegram_id']}</code>\n"
-                f"{row['message'][:300]}\n\n"
-                f"/replyticket {row['id']} متن پاسخ\n\n"
-            )
-
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
-    )
-
-
-async def admin_draw_callback(
-    update,
-    context
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    await query.edit_message_text(
-        "🎲 <b>قرعه‌کشی</b>\n\n"
-        "برای اجرای قرعه‌کشی از دستور زیر استفاده کن:\n\n"
-        "<code>/draw ID</code>\n\n"
-        "⚠️ اجرای قرعه‌کشی تا تکمیل شرایط "
-        "فعال‌سازی 100K قفل است.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔙 پنل مدیریت",
-                    callback_data="admin"
-                )
-            ]
-        ]),
-    )
-
-
-# ============================================================
-# TEXT HANDLER
-# ============================================================
-
-async def text_message(
-    update,
-    context
-):
-    user = update.effective_user
-
-    create_or_update_user(
-        user
-    )
-
-    text = update.message.text.strip()
-
-    # --------------------------------------------------------
-    # SUPPORT MODE
-    # --------------------------------------------------------
-
-    if context.user_data.get(
-        "support_mode"
-    ):
-        if not text:
-            return
-
-        connection = db()
-
-        cursor = connection.execute(
-            """
-            INSERT INTO support_tickets(
-                telegram_id,
-                message,
-                status,
-                created_at
-            )
-            VALUES (?, ?, 'open', ?)
-            """,
-            (
-                user.id,
-                text,
-                now(),
-            ),
-        )
-
-        ticket_id = cursor.lastrowid
-
-        connection.commit()
-        connection.close()
-
-        context.user_data.pop(
-            "support_mode",
-            None
-        )
-
-        # ----------------------------------------------------
-        # SEND TICKET TO ALL ADMINS
-        # ----------------------------------------------------
-
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        "🆘 <b>تیکت جدید پشتیبانی</b>\n\n"
-                        f"🎫 شماره: <b>#{ticket_id}</b>\n"
-                        f"👤 {user.full_name}\n"
-                        f"🆔 <code>{user.id}</code>\n\n"
-                        f"{text}\n\n"
-                        "برای پاسخ:\n"
-                        f"<code>/replyticket "
-                        f"{ticket_id} متن پاسخ</code>"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Sending support ticket to admin failed: %s",
-                    exc
-                )
-
+    if not campaigns:
         await update.message.reply_text(
-            "✅ <b>پیام شما ثبت شد.</b>\n\n"
-            f"🎫 شماره تیکت: <b>#{ticket_id}</b>\n\n"
-            "پیام برای پشتیبانی ارسال شد و پاسخ از طریق "
-            "همین ربات برایت ارسال می‌شود.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu(),
+            "هیچ مسابقه‌ای وجود ندارد."
         )
-
         return
 
-    # --------------------------------------------------------
-    # NORMAL TEXT
-    # --------------------------------------------------------
+    lines = ["<b>🏆 لیست مسابقات</b>\n"]
+
+    for c in campaigns:
+        participants = db_execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM participations
+            WHERE campaign_id = ?
+            """,
+            (c["id"],),
+            fetchone=True,
+            commit=False,
+        )
+
+        lines.append(
+            f"ID: <b>{c['id']}</b>\n"
+            f"عنوان: {c['title']}\n"
+            f"وضعیت: {c['status']}\n"
+            f"شرکت‌کنندگان: {participants['total']}\n"
+            f"قرعه: {'مجاز' if c['draw_allowed'] else 'بسته'}\n"
+        )
 
     await update.message.reply_text(
-        "برای استفاده از ربات از منوی زیر انتخاب کن:",
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# DRAW
+# ============================================================
+
+async def draw_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "مثال:\n/draw 1"
+        )
+        return
+
+    try:
+        campaign_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ شناسه مسابقه نامعتبر است."
+        )
+        return
+
+    if not network_activated():
+        await update.message.reply_text(
+            """
+🛑 قرعه‌کشی هنوز مجاز نیست.
+
+شبکه باید ابتدا فعال شود.
+"""
+        )
+        return
+
+    campaign = db_execute(
+        """
+        SELECT *
+        FROM campaigns
+        WHERE id = ?
+        """,
+        (campaign_id,),
+        fetchone=True,
+        commit=False,
+    )
+
+    if not campaign:
+        await update.message.reply_text(
+            "❌ مسابقه پیدا نشد."
+        )
+        return
+
+    if campaign["status"] != "open":
+        await update.message.reply_text(
+            "❌ این مسابقه دیگر باز نیست."
+        )
+        return
+
+    participants = db_execute(
+        """
+        SELECT
+            p.user_id,
+            p.chances,
+            u.telegram_id,
+            u.first_name,
+            u.username
+        FROM participations p
+        JOIN users u
+            ON u.telegram_id = p.user_id
+        WHERE p.campaign_id = ?
+          AND u.registered = 1
+        """,
+        (campaign_id,),
+        fetchall=True,
+        commit=False,
+    )
+
+    if not participants:
+        await update.message.reply_text(
+            "❌ هیچ شرکت‌کننده‌ای وجود ندارد."
+        )
+        return
+
+    eligible = []
+
+    for p in participants:
+        member = await check_telegram_membership(
+            context.bot,
+            p["telegram_id"],
+        )
+
+        if member:
+            chances = max(
+                1,
+                int(p["chances"]),
+            )
+
+            for _ in range(chances):
+                eligible.append(p)
+
+    if not eligible:
+        await update.message.reply_text(
+            "❌ هیچ شرکت‌کننده واجد شرایطی پیدا نشد."
+        )
+        return
+
+    winner = random.choice(eligible)
+
+    db_execute(
+        """
+        INSERT INTO winners(
+            campaign_id,
+            user_id,
+            telegram_id,
+            chances_at_draw,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            campaign_id,
+            winner["user_id"],
+            winner["telegram_id"],
+            winner["chances"],
+            now_iso(),
+        ),
+    )
+
+    db_execute(
+        """
+        UPDATE campaigns
+        SET status = 'drawn'
+        WHERE id = ?
+        """,
+        (campaign_id,),
+    )
+
+    winner_name = (
+        winner["first_name"]
+        or winner["username"]
+        or str(winner["telegram_id"])
+    )
+
+    await update.message.reply_text(
+        f"""
+🎉 <b>قرعه‌کشی انجام شد</b>
+
+🏆 مسابقه:
+<b>{campaign['title']}</b>
+
+🎁 جایزه:
+<b>{campaign['prize']}</b>
+
+👤 برنده:
+<b>{winner_name}</b>
+
+🆔 Telegram ID:
+<code>{winner['telegram_id']}</code>
+
+🎯 شانس هنگام قرعه:
+<b>{winner['chances']}</b>
+""",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# AUTO POSTS
+# ============================================================
+
+PROMO_MESSAGES = [
+    """
+🎉 <b>محفل خوش‌شانس‌ها شروع شده!</b>
+
+ثبت‌نام رایگان از همین حالا فعال است.
+
+🎟 ثبت‌نام کن
+👥 دوستانت را دعوت کن
+🎯 شانس بیشتری بگیر
+📸 اینستاگرام را دنبال کن
+▶️ یوتیوب را دنبال کن
+📢 عضو کانال تلگرام باش
+
+⏳ قرعه‌کشی پس از فعال شدن شبکه انجام می‌شود.
+
+🔥 هیچ هزینه‌ای برای ثبت‌نام رایگان دریافت نمی‌شود.
+""",
+    """
+🎯 <b>یک شانس بیشتر می‌خواهی؟</b>
+
+دوستانت را با لینک اختصاصی خودت به محفل خوش‌شانس‌ها دعوت کن.
+
+هر معرفی موفق:
+➕ ۱ شانس
+
+ثبت‌نام رایگان فعال است و ثبت‌نام مسابقه مستقل از فعال شدن شبکه انجام می‌شود.
+
+📸 Instagram
+▶️ YouTube
+📢 Telegram
+""",
+    """
+🏆 <b>محفل خوش‌شانس‌ها</b>
+
+هدف شبکه:
+<b>100,000</b>
+
+وقتی شبکه طبق قوانین به هدف برسد، شرایط قرعه‌کشی فعال می‌شود.
+
+اما برای ثبت‌نام لازم نیست منتظر بمانی.
+
+🎟 همین حالا ثبت‌نام کن
+👥 دوستانت را دعوت کن
+🎯 شانس جمع کن
+""",
+]
+
+
+async def post_promo(bot):
+    if not AUTO_POST_ENABLED:
+        return False
+
+    try:
+        index = random.randint(
+            0,
+            len(PROMO_MESSAGES) - 1,
+        )
+
+        await bot.send_message(
+            chat_id=TELEGRAM_CHANNEL,
+            text=PROMO_MESSAGES[index],
+            parse_mode=ParseMode.HTML,
+        )
+
+        set_setting(
+            "last_auto_post",
+            now_iso(),
+        )
+
+        return True
+
+    except Exception as exc:
+        logger.exception(
+            "Auto post failed: %s",
+            exc,
+        )
+        return False
+
+
+async def postnow_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    ok = await post_promo(
+        context.bot
+    )
+
+    await update.message.reply_text(
+        "✅ پیام ارسال شد."
+        if ok
+        else "❌ ارسال پیام انجام نشد."
+    )
+
+
+async def auto_post_job(context):
+    await post_promo(context.bot)
+
+
+# ============================================================
+# YOUTUBE
+# ============================================================
+
+def fetch_youtube_subscribers():
+    url = (
+        "https://www.googleapis.com/youtube/v3/channels"
+        "?part=statistics"
+        f"&id={YOUTUBE_CHANNEL_ID}"
+        f"&key={YOUTUBE_API_KEY}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    items = data.get("items", [])
+
+    if not items:
+        raise RuntimeError(
+            "YouTube channel not found."
+        )
+
+    statistics = items[0].get(
+        "statistics",
+        {},
+    )
+
+    return int(
+        statistics.get(
+            "subscriberCount",
+            0,
+        )
+    )
+
+
+async def youtube_background_update(context):
+    if not YOUTUBE_API_KEY:
+        return
+
+    if not YOUTUBE_CHANNEL_ID:
+        return
+
+    try:
+        value = await asyncio.to_thread(
+            fetch_youtube_subscribers
+        )
+
+        set_setting(
+            "youtube_followers",
+            value,
+        )
+
+        active = update_activation_status()
+
+        logger.info(
+            "YouTube followers updated: %s | active=%s",
+            value,
+            active,
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "YouTube background update failed: %s",
+            exc,
+        )
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start_command(update, context):
+    user = update.effective_user
+
+    ensure_user(user)
+
+    # referral
+    if context.args:
+        arg = context.args[0]
+
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(
+                    arg.split("_", 1)[1]
+                )
+
+                if process_referral(
+                    user.id,
+                    referrer_id,
+                ):
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer_id,
+                            text=(
+                                "🎉 یک معرفی موفق داشتی!\n\n"
+                                "🎯 +۱ شانس به حساب تو اضافه شد."
+                            ),
+                        )
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+    user = get_user(user.id)
+
+    await update.message.reply_text(
+        home_text(user),
+        parse_mode=ParseMode.HTML,
         reply_markup=main_menu(),
     )
 
 
 # ============================================================
-# AUTOMATIC POSTS
+# REGISTRATION MENU
 # ============================================================
 
-async def automatic_channel_post(
-    application
-):
-    if not AUTO_POST_ENABLED:
+async def registration_page(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    user = ensure_user(query.from_user)
+
+    await query.edit_message_text(
+        f"""
+<b>🎟 ثبت‌نام مسابقه</b>
+
+🆓 ثبت‌نام رایگان:
+🟢 فعال
+
+💳 ثبت‌نام پولی:
+🔴 فعلاً خاموش
+
+ثبت‌نام مسابقه مستقل از فعال شدن شبکه است.
+
+یعنی حتی اگر شبکه هنوز به {ACTIVATION_TARGET:,} نرسیده باشد، می‌توانی ثبت‌نام کنی، شانس بگیری و دوستانت را دعوت کنی.
+""",
+        parse_mode=ParseMode.HTML,
+        reply_markup=registration_menu(),
+    )
+
+
+async def paid_disabled(update, context):
+    query = update.callback_query
+    await query.answer(
+        "ثبت‌نام پولی فعلاً فعال نشده است.",
+        show_alert=True,
+    )
+
+
+# ============================================================
+# CALLBACK ROUTER
+# ============================================================
+
+async def callback_router(update, context):
+    query = update.callback_query
+
+    if query.data == "home":
+        await query.answer()
+
+        user = ensure_user(
+            query.from_user
+        )
+
+        await query.edit_message_text(
+            home_text(user),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+
+    elif query.data == "register":
+        await registration_page(
+            update,
+            context,
+        )
+
+    elif query.data == "register_free":
+        await register_free_user(
+            update,
+            context,
+        )
+
+    elif query.data == "paid_disabled":
+        await paid_disabled(
+            update,
+            context,
+        )
+
+    elif query.data == "campaigns":
+        await show_campaigns(
+            update,
+            context,
+        )
+
+    elif query.data.startswith("join:"):
+        await join_campaign(
+            update,
+            context,
+        )
+
+    elif query.data == "rules":
+        await show_rules(
+            update,
+            context,
+        )
+
+    elif query.data == "accept_rules":
+        await accept_rules(
+            update,
+            context,
+        )
+
+    elif query.data == "accept_rules_register":
+        await accept_rules_register(
+            update,
+            context,
+        )
+
+    elif query.data.startswith("accept_rules_join:"):
+        await accept_rules_join(
+            update,
+            context,
+        )
+
+    elif query.data == "my_chances":
+        await show_my_chances(
+            update,
+            context,
+        )
+
+    elif query.data == "referral":
+        await show_referral(
+            update,
+            context,
+        )
+
+    elif query.data == "activation":
+        await query.answer()
+
+        await query.edit_message_text(
+            activation_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+
+    elif query.data == "eligibility":
+        await show_eligibility(
+            update,
+            context,
+        )
+
+    elif query.data == "check_tg":
+        await check_tg(
+            update,
+            context,
+        )
+
+    elif query.data == "support":
+        await show_support(
+            update,
+            context,
+        )
+
+    elif query.data == "support_new":
+        await start_support_ticket(
+            update,
+            context,
+        )
+
+    elif query.data.startswith("reply_ticket:"):
+        await admin_reply_button(
+            update,
+            context,
+        )
+
+    elif query.data.startswith("close_ticket:"):
+        await close_ticket(
+            update,
+            context,
+        )
+
+
+# ============================================================
+# TICKETS ADMIN
+# ============================================================
+
+async def tickets_command(update, context):
+    if not is_admin(update.effective_user.id):
         return
 
-    try:
-        await application.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL,
-            text=promotional_text(),
+    tickets = db_execute(
+        """
+        SELECT *
+        FROM support_tickets
+        WHERE status = 'open'
+        ORDER BY id DESC
+        LIMIT 20
+        """,
+        fetchall=True,
+        commit=False,
+    )
+
+    if not tickets:
+        await update.message.reply_text(
+            "🎧 هیچ تیکت بازی وجود ندارد."
+        )
+        return
+
+    for ticket in tickets:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "↩️ پاسخ",
+                    callback_data=f"reply_ticket:{ticket['id']}",
+                ),
+                InlineKeyboardButton(
+                    "✅ بستن",
+                    callback_data=f"close_ticket:{ticket['id']}",
+                ),
+            ]
+        ])
+
+        await update.message.reply_text(
+            f"""
+🎫 <b>تیکت #{ticket['id']}</b>
+
+👤 User ID:
+<code>{ticket['user_telegram_id']}</code>
+
+💬 {ticket['message']}
+""",
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-        )
-
-        set_setting(
-            "last_auto_post",
-            now()
-        )
-
-        logger.info(
-            "Automatic promotional post sent."
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "Automatic post failed: %s",
-            exc
+            reply_markup=keyboard,
         )
 
 
-async def background_loop(
-    application
-):
-    """
-    حلقه داخلی:
-    - تبلیغ هر ۲ ساعت
-    - بروزرسانی YouTube هر ۱ ساعت
-    - بروزرسانی Telegram هر ۳۰ دقیقه
-    """
+# ============================================================
+# BROADCAST
+# ============================================================
 
-    await asyncio.sleep(60)
+async def broadcast_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
 
-    last_ad = 0
-    last_youtube = 0
-    last_telegram = 0
+    text = update.message.text[
+        len("/broadcast"):
+    ].strip()
 
-    while True:
+    if not text:
+        await update.message.reply_text(
+            "مثال:\n/broadcast سلام به همه کاربران"
+        )
+        return
+
+    users = db_execute(
+        """
+        SELECT telegram_id
+        FROM users
+        """,
+        fetchall=True,
+        commit=False,
+    )
+
+    success = 0
+    failed = 0
+
+    for user in users:
         try:
-            current = asyncio.get_running_loop().time()
-
-            # ------------------------------------------------
-            # AUTO AD
-            # ------------------------------------------------
-
-            if AUTO_POST_ENABLED:
-                if (
-                    current - last_ad
-                    >= AUTO_POST_HOURS * 3600
-                ):
-                    await automatic_channel_post(
-                        application
-                    )
-
-                    last_ad = current
-
-            # ------------------------------------------------
-            # YOUTUBE
-            # ------------------------------------------------
-
-            if (
-                YOUTUBE_API_KEY
-                and
-                YOUTUBE_CHANNEL_ID
-            ):
-                if current - last_youtube >= 3600:
-                    count = fetch_youtube_followers()
-
-                    if count is not None:
-                        set_setting(
-                            "youtube_followers",
-                            count
-                        )
-
-                        set_setting(
-                            "last_youtube_check",
-                            now()
-                        )
-
-                        check_activation()
-
-                    last_youtube = current
-
-            # ------------------------------------------------
-            # TELEGRAM
-            # ------------------------------------------------
-
-            if current - last_telegram >= 1800:
-                await update_telegram_count(
-                    application.bot
-                )
-
-                check_activation()
-
-                last_telegram = current
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as exc:
-            logger.exception(
-                "Background loop error: %s",
-                exc
+            await context.bot.send_message(
+                chat_id=user["telegram_id"],
+                text=text,
             )
 
-        await asyncio.sleep(30)
+            success += 1
 
+            await asyncio.sleep(0.05)
 
-async def post_init(
-    application
-):
-    logger.info(
-        "MAHFELSHANS BOT STARTED"
-    )
+        except Exception:
+            failed += 1
 
-    logger.info(
-        "Admins: %s",
-        sorted(ADMIN_IDS)
-    )
+    await update.message.reply_text(
+        f"""
+📢 ارسال همگانی تمام شد.
 
-    logger.info(
-        "Telegram channel: %s",
-        TELEGRAM_CHANNEL
-    )
-
-    application.create_task(
-        background_loop(
-            application
-        )
+✅ موفق: {success}
+❌ ناموفق: {failed}
+"""
     )
 
 
@@ -3621,27 +2943,109 @@ async def post_init(
 # ERROR HANDLER
 # ============================================================
 
-async def error_handler(
-    update,
-    context
-):
+async def error_handler(update, context):
     logger.exception(
-        "Unhandled exception: %s",
-        context.error
+        "Unhandled exception:",
+        exc_info=context.error,
+    )
+
+
+# ============================================================
+# HEALTH SERVER FOR RENDER
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            body = b"MAHFELSHANS BOT OK"
+
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8",
+            )
+            self.send_header(
+                "Content-Length",
+                str(len(body)),
+            )
+            self.end_headers()
+            self.wfile.write(body)
+
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    try:
+        server = ThreadingHTTPServer(
+            ("0.0.0.0", PORT),
+            HealthHandler,
+        )
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+
+        thread.start()
+
+        logger.info(
+            "Health server started on port %s",
+            PORT,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Health server failed: %s",
+            exc,
+        )
+
+
+# ============================================================
+# POST INIT
+# ============================================================
+
+async def post_init(application):
+    logger.info(
+        "MAHFELSHANS BOT started."
     )
 
     try:
-        if (
-            update
-            and
-            update.effective_message
-        ):
-            await update.effective_message.reply_text(
-                "⚠️ یک خطای موقت رخ داد.\n"
-                "لطفاً دوباره تلاش کنید."
+        await application.bot.set_my_commands([
+            ("start", "شروع"),
+            ("myid", "نمایش شناسه"),
+            ("admin", "پنل مدیریت"),
+            ("status", "وضعیت سیستم"),
+        ])
+    except Exception as exc:
+        logger.warning(
+            "Could not set bot commands: %s",
+            exc,
+        )
+
+    if application.job_queue:
+
+        if AUTO_POST_ENABLED:
+            application.job_queue.run_repeating(
+                auto_post_job,
+                interval=AUTO_POST_HOURS * 3600,
+                first=30,
+                name="auto_promo",
             )
-    except Exception:
-        pass
+
+        if YOUTUBE_API_KEY and YOUTUBE_CHANNEL_ID:
+            application.job_queue.run_repeating(
+                youtube_background_update,
+                interval=3600,
+                first=60,
+                name="youtube_update",
+            )
 
 
 # ============================================================
@@ -3649,9 +3053,10 @@ async def error_handler(
 # ============================================================
 
 def build_application():
+
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
+            "BOT_TOKEN is missing. Add BOT_TOKEN in Render Environment."
         )
 
     application = (
@@ -3661,328 +3066,153 @@ def build_application():
         .build()
     )
 
-    # --------------------------------------------------------
-    # COMMANDS
-    # --------------------------------------------------------
-
+    # Commands
     application.add_handler(
         CommandHandler(
             "start",
-            start
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "myid",
-            myid
+            myid_command,
         )
     )
 
+    # Admin commands
     application.add_handler(
         CommandHandler(
             "admin",
-            admin_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "adminhelp",
-            adminhelp
+            admin_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "status",
-            status
+            status_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "users",
-            users_command
+            users_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "igfollowers",
-            igfollowers
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "tgfollowers",
-            tgfollowers
+            igfollowers_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "ytfollowers",
-            ytfollowers
+            ytfollowers_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "tgfollowers",
+            tgfollowers_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "activate",
+            activate_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "deactivate",
+            deactivate_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "createcampaign",
-            createcampaign
+            create_campaign_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "campaigns",
-            campaigns_command
+            campaigns_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "draw",
-            draw
+            draw_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "postnow",
-            postnow
+            postnow_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
             "tickets",
-            tickets_command
+            tickets_command,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            "replyticket",
-            replyticket
+            "broadcast",
+            broadcast_command,
         )
     )
 
-    # --------------------------------------------------------
-    # START / RULES / REGISTRATION
-    # --------------------------------------------------------
-
+    # Callback buttons
     application.add_handler(
         CallbackQueryHandler(
-            rules_callback,
-            pattern="^rules$"
+            callback_router,
         )
     )
 
+    # Admin replies to support
     application.add_handler(
-        CallbackQueryHandler(
-            accept_rules_callback,
-            pattern="^accept_rules$"
-        )
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND
+            & filters.User(user_id=ADMIN_IDS),
+            send_admin_reply,
+        ),
+        group=0,
     )
 
-    application.add_handler(
-        CallbackQueryHandler(
-            register_free_callback,
-            pattern="^register_free$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            paid_disabled_callback,
-            pattern="^paid_disabled$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            guide_callback,
-            pattern="^guide$"
-        )
-    )
-
-    # --------------------------------------------------------
-    # HOME
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            home_callback,
-            pattern="^home$"
-        )
-    )
-
-    # --------------------------------------------------------
-    # USER
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            my_registration_callback,
-            pattern="^my_registration$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            referral_callback,
-            pattern="^referral$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            chances_callback,
-            pattern="^my_chances$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            eligibility_callback,
-            pattern="^eligibility$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            network_callback,
-            pattern="^network$"
-        )
-    )
-
-    # --------------------------------------------------------
-    # CAMPAIGNS
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            campaigns_callback,
-            pattern="^campaigns$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            campaign_details,
-            pattern=r"^campaign:\d+$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            join_campaign,
-            pattern=r"^join:\d+$"
-        )
-    )
-
-    # --------------------------------------------------------
-    # SUPPORT
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            support_callback,
-            pattern="^support$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            support_cancel,
-            pattern="^support_cancel$"
-        )
-    )
-
-    # --------------------------------------------------------
-    # ADMIN
-    # --------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_callback,
-            pattern="^admin$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_status_callback,
-            pattern="^admin_status$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_users_callback,
-            pattern="^admin_users$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_campaigns_callback,
-            pattern="^admin_campaigns$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_post_callback,
-            pattern="^admin_post$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_networks_callback,
-            pattern="^admin_networks$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_youtube_callback,
-            pattern="^admin_youtube$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_support_callback,
-            pattern="^admin_support$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_draw_callback,
-            pattern="^admin_draw$"
-        )
-    )
-
-    # --------------------------------------------------------
-    # TEXT
-    # --------------------------------------------------------
-
+    # User support messages
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_message
-        )
+            send_support_ticket,
+        ),
+        group=1,
     )
-
-    # --------------------------------------------------------
-    # ERROR
-    # --------------------------------------------------------
 
     application.add_error_handler(
         error_handler
@@ -3996,39 +3226,36 @@ def build_application():
 # ============================================================
 
 def main():
-    init_db()
+
+    init_database()
+
+    start_health_server()
+
+    logger.info(
+        "Starting MAHFELSHANS..."
+    )
+
+    logger.info(
+        "Admins: %s",
+        ADMIN_IDS,
+    )
+
+    logger.info(
+        "Channel: %s",
+        TELEGRAM_CHANNEL,
+    )
+
+    logger.info(
+        "Activation target: %s",
+        ACTIVATION_TARGET,
+    )
 
     application = build_application()
 
-    if RENDER_EXTERNAL_URL:
-        webhook_url = (
-            f"{RENDER_EXTERNAL_URL.rstrip('/')}/"
-            f"{WEBHOOK_PATH}"
-        )
-
-        logger.info(
-            "Starting webhook: %s",
-            webhook_url
-        )
-
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH,
-            webhook_url=webhook_url,
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-
-    else:
-        logger.info(
-            "Starting polling mode."
-        )
-
-        application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
